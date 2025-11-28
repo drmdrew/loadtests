@@ -105,10 +105,10 @@ services:
       - QUERY_INTERVAL=500ms
       - GC_GARBAGE_INTERVAL=1s
       - BGSAVE_INTERVAL=15m
-      - NUM_DYNAMIC_GRAPH_WORKERS=5
-      - NUM_UPDATE_WORKERS=5
-      - NUM_QUERY_WORKERS=15
-      - NUM_GC_GARBAGE_WORKERS=15
+      - NUM_DYNAMIC_GRAPH_WORKERS=2
+      - NUM_UPDATE_WORKERS=2
+      - NUM_QUERY_WORKERS=2
+      - NUM_GC_GARBAGE_WORKERS=2
     depends_on:
       redisgraph-master:
         condition: service_healthy

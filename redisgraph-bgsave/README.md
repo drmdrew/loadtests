@@ -1,6 +1,7 @@
 # BGSAVE Hang Test Driver
 
-This test driver is designed to reproduce the BGSAVE hang condition observed in RedisGraph where a forked child process hangs waiting on a futex (pthread_rwlock_t).
+This test driver is designed to try and reproduce the BGSAVE hang condition observed in RedisGraph
+where a forked child process hangs waiting on a futex (pthread_rwlock_t).
 
 ## Setup
 
