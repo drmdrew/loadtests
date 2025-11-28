@@ -2,6 +2,7 @@ services:
   redisgraph-master:
     image: redislabs/redisgraph:2.12.10
     container_name: redisgraph-master
+    restart: unless-stopped
     # Ports removed - services communicate via internal network
     # Uncomment if you need external access:
     # ports:
@@ -15,7 +16,8 @@ services:
     command: >
       redis-server
       --dir /data
-      --save 15 1
+      --save 900 1
+      --loglevel verbose
       --loadmodule /usr/lib/redis/modules/redisgraph.so THREAD_COUNT 40
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
@@ -26,6 +28,7 @@ services:
   redisgraph-replica:
     image: redislabs/redisgraph:2.12.10
     container_name: redisgraph-replica
+    restart: unless-stopped
     # Ports removed - services communicate via internal network
     # Uncomment if you need external access:
     # ports:
@@ -39,7 +42,7 @@ services:
     command: >
       redis-server
       --dir /data
-      --save 15 1
+      --save 900 1
       --replicaof redisgraph-master 6379
       --loadmodule /usr/lib/redis/modules/redisgraph.so THREAD_COUNT 40
     depends_on:
@@ -54,6 +57,7 @@ services:
   redisgraph-replica2:
     image: redislabs/redisgraph:2.12.10
     container_name: redisgraph-replica2
+    restart: unless-stopped
     # Ports removed - services communicate via internal network
     # Uncomment if you need external access:
     # ports:
@@ -67,7 +71,7 @@ services:
     command: >
       redis-server
       --dir /data
-      --save 15 1
+      --save 900 1
       --replicaof redisgraph-master 6379
       --loadmodule /usr/lib/redis/modules/redisgraph.so THREAD_COUNT 40
     depends_on:
@@ -84,6 +88,7 @@ services:
       context: ./tester
       dockerfile: Dockerfile
     container_name: redisgraph-testdriver
+    restart: unless-stopped
     networks:
       - bgsave-test-network
     environment:
@@ -99,11 +104,11 @@ services:
       - DYNAMIC_GRAPH_INTERVAL=500ms
       - QUERY_INTERVAL=500ms
       - GC_GARBAGE_INTERVAL=1s
-      - BGSAVE_INTERVAL=15s
+      - BGSAVE_INTERVAL=15m
       - NUM_DYNAMIC_GRAPH_WORKERS=5
       - NUM_UPDATE_WORKERS=5
-      - NUM_QUERY_WORKERS=10
-      - NUM_GC_GARBAGE_WORKERS=10
+      - NUM_QUERY_WORKERS=15
+      - NUM_GC_GARBAGE_WORKERS=15
     depends_on:
       redisgraph-master:
         condition: service_healthy

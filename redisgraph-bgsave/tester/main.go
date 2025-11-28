@@ -2,9 +2,11 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"math/rand"
+	"net"
 	"os"
 	"os/signal"
 	"strconv"
@@ -181,6 +183,76 @@ func createRedisClient(addr string) *redis.Client {
 		Password: "",
 		DB:       0,
 	})
+}
+
+// isMasterConnectivityError checks if an error indicates loss of connectivity to the master
+func isMasterConnectivityError(err error, masterAddr string) bool {
+	if err == nil {
+		return false
+	}
+	errStr := err.Error()
+
+	// Check for DNS lookup failures
+	if strings.Contains(errStr, "lookup") && strings.Contains(errStr, "no such host") {
+		return true
+	}
+
+	// Check for connection refused
+	if strings.Contains(errStr, "connection refused") {
+		return true
+	}
+
+	// Check for network unreachable
+	if strings.Contains(errStr, "network is unreachable") {
+		return true
+	}
+
+	// Check for timeout errors
+	if strings.Contains(errStr, "timeout") || strings.Contains(errStr, "deadline exceeded") {
+		return true
+	}
+
+	// Check for dial errors (includes DNS lookup failures)
+	if strings.Contains(errStr, "dial tcp") {
+		// Extract the hostname from masterAddr to check if error mentions it
+		host := masterAddr
+		if idx := strings.Index(masterAddr, ":"); idx > 0 {
+			host = masterAddr[:idx]
+		}
+		if strings.Contains(errStr, host) {
+			return true
+		}
+	}
+
+	// Check for network errors using Go's error types
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		return true
+	}
+
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) {
+		return true
+	}
+
+	return false
+}
+
+// handleMasterConnectivityLoss logs the error and exits immediately when master connectivity is lost
+func handleMasterConnectivityLoss(err error, masterAddr string, cancel context.CancelFunc) {
+	log.Printf("FATAL: Lost contact with master (%s): %v. Exiting...", masterAddr, err)
+	cancel()
+	// Give a brief moment for the log to flush, then exit
+	time.Sleep(100 * time.Millisecond)
+	os.Exit(1)
+}
+
+// exitOnMasterConnectivityLoss logs the error and exits immediately when master connectivity is lost
+// Used during initialization when cancel context is not available
+func exitOnMasterConnectivityLoss(err error, masterAddr string) {
+	log.Printf("FATAL: Lost contact with master (%s): %v. Exiting...", masterAddr, err)
+	time.Sleep(100 * time.Millisecond)
+	os.Exit(1)
 }
 
 func graphExists(ctx context.Context, client *redis.Client, graphName string) (bool, error) {
@@ -390,6 +462,10 @@ func ensureGraphsPopulated(ctx context.Context, masterClient *redis.Client, conf
 
 		exists, err := graphExists(ctx, masterClient, graphName)
 		if err != nil {
+			if isMasterConnectivityError(err, config.MasterAddr) {
+				log.Printf("FATAL: Lost contact with master (%s): %v. Exiting...", config.MasterAddr, err)
+				exitOnMasterConnectivityLoss(err, config.MasterAddr)
+			}
 			log.Printf("Error checking graph %s: %v", graphName, err)
 			continue
 		}
@@ -398,6 +474,10 @@ func ensureGraphsPopulated(ctx context.Context, masterClient *redis.Client, conf
 			if config.SimpleSeedOnly {
 				// Simple seed: just create one node
 				if err := simpleSeedGraph(ctx, masterClient, graphName); err != nil {
+					if isMasterConnectivityError(err, config.MasterAddr) {
+						log.Printf("FATAL: Lost contact with master (%s): %v. Exiting...", config.MasterAddr, err)
+						exitOnMasterConnectivityLoss(err, config.MasterAddr)
+					}
 					log.Printf("Failed to seed graph %s: %v", graphName, err)
 					return fmt.Errorf("failed to seed graph %s: %w", graphName, err)
 				}
@@ -405,6 +485,10 @@ func ensureGraphsPopulated(ctx context.Context, masterClient *redis.Client, conf
 				// Full population
 				log.Printf("Graph %s does not exist, populating...", graphName)
 				if err := populateGraph(ctx, masterClient, graphName, config.TargetNodesPerGraph); err != nil {
+					if isMasterConnectivityError(err, config.MasterAddr) {
+						log.Printf("FATAL: Lost contact with master (%s): %v. Exiting...", config.MasterAddr, err)
+						exitOnMasterConnectivityLoss(err, config.MasterAddr)
+					}
 					log.Printf("Failed to populate graph %s: %v", graphName, err)
 					return fmt.Errorf("failed to populate graph %s: %w", graphName, err)
 				}
@@ -419,6 +503,10 @@ func ensureGraphsPopulated(ctx context.Context, masterClient *redis.Client, conf
 					if count == 0 {
 						log.Printf("Graph %s exists but has 0 nodes, reseeding...", graphName)
 						if err := simpleSeedGraph(ctx, masterClient, graphName); err != nil {
+							if isMasterConnectivityError(err, config.MasterAddr) {
+								log.Printf("FATAL: Lost contact with master (%s): %v. Exiting...", config.MasterAddr, err)
+								exitOnMasterConnectivityLoss(err, config.MasterAddr)
+							}
 							log.Printf("Failed to reseed graph %s: %v", graphName, err)
 						}
 					} else {
@@ -430,6 +518,10 @@ func ensureGraphsPopulated(ctx context.Context, masterClient *redis.Client, conf
 					if count < threshold {
 						log.Printf("Graph %s has only %d nodes (target: %d), repopulating...", graphName, count, config.TargetNodesPerGraph)
 						if err := populateGraph(ctx, masterClient, graphName, config.TargetNodesPerGraph); err != nil {
+							if isMasterConnectivityError(err, config.MasterAddr) {
+								log.Printf("FATAL: Lost contact with master (%s): %v. Exiting...", config.MasterAddr, err)
+								exitOnMasterConnectivityLoss(err, config.MasterAddr)
+							}
 							log.Printf("Failed to repopulate graph %s: %v", graphName, err)
 						}
 					} else {
@@ -447,6 +539,10 @@ func ensureGraphsPopulated(ctx context.Context, masterClient *redis.Client, conf
 
 		exists, err := graphExists(ctx, masterClient, graphName)
 		if err != nil {
+			if isMasterConnectivityError(err, config.MasterAddr) {
+				log.Printf("FATAL: Lost contact with master (%s): %v. Exiting...", config.MasterAddr, err)
+				exitOnMasterConnectivityLoss(err, config.MasterAddr)
+			}
 			log.Printf("Error checking dynamic graph %s: %v", graphName, err)
 			continue
 		}
@@ -455,6 +551,10 @@ func ensureGraphsPopulated(ctx context.Context, masterClient *redis.Client, conf
 			if config.SimpleSeedOnly {
 				// Simple seed: just create one node
 				if err := simpleSeedGraph(ctx, masterClient, graphName); err != nil {
+					if isMasterConnectivityError(err, config.MasterAddr) {
+						log.Printf("FATAL: Lost contact with master (%s): %v. Exiting...", config.MasterAddr, err)
+						exitOnMasterConnectivityLoss(err, config.MasterAddr)
+					}
 					log.Printf("Failed to seed dynamic graph %s: %v", graphName, err)
 					// Don't fail completely, just log and continue
 				}
@@ -462,6 +562,10 @@ func ensureGraphsPopulated(ctx context.Context, masterClient *redis.Client, conf
 				// Full population
 				log.Printf("Dynamic graph %s does not exist, populating...", graphName)
 				if err := populateGraph(ctx, masterClient, graphName, config.TargetNodesPerGraph); err != nil {
+					if isMasterConnectivityError(err, config.MasterAddr) {
+						log.Printf("FATAL: Lost contact with master (%s): %v. Exiting...", config.MasterAddr, err)
+						exitOnMasterConnectivityLoss(err, config.MasterAddr)
+					}
 					log.Printf("Failed to populate dynamic graph %s: %v", graphName, err)
 					// Don't fail completely, just log and continue
 				}
@@ -469,6 +573,10 @@ func ensureGraphsPopulated(ctx context.Context, masterClient *redis.Client, conf
 		} else {
 			count, err := getNodeCount(ctx, masterClient, graphName)
 			if err != nil {
+				if isMasterConnectivityError(err, config.MasterAddr) {
+					log.Printf("FATAL: Lost contact with master (%s): %v. Exiting...", config.MasterAddr, err)
+					exitOnMasterConnectivityLoss(err, config.MasterAddr)
+				}
 				log.Printf("Warning: could not get node count for %s: %v", graphName, err)
 			} else {
 				if config.SimpleSeedOnly {
@@ -476,6 +584,10 @@ func ensureGraphsPopulated(ctx context.Context, masterClient *redis.Client, conf
 					if count == 0 {
 						log.Printf("Dynamic graph %s exists but has 0 nodes, reseeding...", graphName)
 						if err := simpleSeedGraph(ctx, masterClient, graphName); err != nil {
+							if isMasterConnectivityError(err, config.MasterAddr) {
+								log.Printf("FATAL: Lost contact with master (%s): %v. Exiting...", config.MasterAddr, err)
+								exitOnMasterConnectivityLoss(err, config.MasterAddr)
+							}
 							log.Printf("Failed to reseed dynamic graph %s: %v", graphName, err)
 						}
 					} else {
@@ -487,6 +599,10 @@ func ensureGraphsPopulated(ctx context.Context, masterClient *redis.Client, conf
 					if count < threshold {
 						log.Printf("Dynamic graph %s has only %d nodes (target: %d), repopulating...", graphName, count, config.TargetNodesPerGraph)
 						if err := populateGraph(ctx, masterClient, graphName, config.TargetNodesPerGraph); err != nil {
+							if isMasterConnectivityError(err, config.MasterAddr) {
+								log.Printf("FATAL: Lost contact with master (%s): %v. Exiting...", config.MasterAddr, err)
+								exitOnMasterConnectivityLoss(err, config.MasterAddr)
+							}
 							log.Printf("Failed to repopulate dynamic graph %s: %v", graphName, err)
 						}
 					} else {
@@ -580,12 +696,14 @@ func randomJitter(maxMs int) time.Duration {
 	return time.Duration(rand.Intn(maxMs)) * time.Millisecond
 }
 
-func updateWorker(ctx context.Context, client *redis.Client, config Config, done chan struct{}) {
+func updateWorker(ctx context.Context, client *redis.Client, config Config, cancel context.CancelFunc, done chan struct{}) {
 	ticker := time.NewTicker(config.UpdateInterval)
 	defer ticker.Stop()
 
 	for {
 		select {
+		case <-ctx.Done():
+			return
 		case <-done:
 			return
 		case <-ticker.C:
@@ -614,6 +732,9 @@ func updateWorker(ctx context.Context, client *redis.Client, config Config, done
 
 			_, err := client.Do(ctx, "GRAPH.QUERY", graphName, updateNodesQuery).Result()
 			if err != nil {
+				if isMasterConnectivityError(err, config.MasterAddr) {
+					handleMasterConnectivityLoss(err, config.MasterAddr, cancel)
+				}
 				log.Printf("Update nodes failed for %s: %v", graphName, err)
 				continue
 			}
@@ -625,6 +746,9 @@ func updateWorker(ctx context.Context, client *redis.Client, config Config, done
 				updateRelsQuery := fmt.Sprintf("MATCH (n)-[r]->(m) SET r._updated = %d", now)
 				_, err2 := client.Do(ctx, "GRAPH.QUERY", graphName, updateRelsQuery).Result()
 				if err2 != nil {
+					if isMasterConnectivityError(err2, config.MasterAddr) {
+						handleMasterConnectivityLoss(err2, config.MasterAddr, cancel)
+					}
 					// It's okay if there are no relationships, just log it
 					log.Printf("Update relationships failed for %s (may have no relationships): %v", graphName, err2)
 				}
@@ -633,6 +757,9 @@ func updateWorker(ctx context.Context, client *redis.Client, config Config, done
 				updateRelsQuery := fmt.Sprintf("MATCH (n)-[r]->(m) WHERE id(n) %% 2 = 0 SET r._updated = %d", now)
 				_, err2 := client.Do(ctx, "GRAPH.QUERY", graphName, updateRelsQuery).Result()
 				if err2 != nil {
+					if isMasterConnectivityError(err2, config.MasterAddr) {
+						handleMasterConnectivityLoss(err2, config.MasterAddr, cancel)
+					}
 					// It's okay if there are no relationships, just log it
 					log.Printf("Update relationships failed for %s (may have no relationships): %v", graphName, err2)
 				}
@@ -647,7 +774,7 @@ func updateWorker(ctx context.Context, client *redis.Client, config Config, done
 	}
 }
 
-func dynamicGraphWorker(ctx context.Context, client *redis.Client, config Config, done chan struct{}) {
+func dynamicGraphWorker(ctx context.Context, client *redis.Client, config Config, cancel context.CancelFunc, done chan struct{}) {
 	ticker := time.NewTicker(config.DynamicGraphInterval)
 	defer ticker.Stop()
 
@@ -657,6 +784,8 @@ func dynamicGraphWorker(ctx context.Context, client *redis.Client, config Config
 
 	for {
 		select {
+		case <-ctx.Done():
+			return
 		case <-done:
 			return
 		case <-ticker.C:
@@ -673,6 +802,9 @@ func dynamicGraphWorker(ctx context.Context, client *redis.Client, config Config
 			var graphName string
 
 			if err != nil {
+				if isMasterConnectivityError(err, config.MasterAddr) {
+					handleMasterConnectivityLoss(err, config.MasterAddr, cancel)
+				}
 				log.Printf("Warning: GRAPH.LIST failed: %v, falling back to random selection", err)
 				// Fallback to random selection if GRAPH.LIST fails
 				graphNum := rand.Intn(maxDynamicGraphs)
@@ -709,6 +841,9 @@ func dynamicGraphWorker(ctx context.Context, client *redis.Client, config Config
 			// If the graph doesn't exist (e.g., deleted by another worker), that's fine - just continue
 			deleted, err := client.Del(ctx, graphName).Result()
 			if err != nil {
+				if isMasterConnectivityError(err, config.MasterAddr) {
+					handleMasterConnectivityLoss(err, config.MasterAddr, cancel)
+				}
 				// Check if it's a "graph doesn't exist" error (expected when another worker deleted it)
 				errStr := err.Error()
 				if strings.Contains(errStr, "not found") ||
@@ -734,6 +869,9 @@ func dynamicGraphWorker(ctx context.Context, client *redis.Client, config Config
 			// Recreate and populate the graph (this triggers Globals_AddGraph)
 			if config.SimpleSeedOnly {
 				if err := simpleSeedGraph(ctx, client, graphName); err != nil {
+					if isMasterConnectivityError(err, config.MasterAddr) {
+						handleMasterConnectivityLoss(err, config.MasterAddr, cancel)
+					}
 					// Check if it's a transient error (graph might have been recreated by another worker)
 					errStr := err.Error()
 					if strings.Contains(errStr, "already exists") {
@@ -746,6 +884,9 @@ func dynamicGraphWorker(ctx context.Context, client *redis.Client, config Config
 				}
 			} else {
 				if err := populateGraph(ctx, client, graphName, config.TargetNodesPerGraph); err != nil {
+					if isMasterConnectivityError(err, config.MasterAddr) {
+						handleMasterConnectivityLoss(err, config.MasterAddr, cancel)
+					}
 					// Check if it's a transient error (graph might have been recreated by another worker)
 					errStr := err.Error()
 					if strings.Contains(errStr, "already exists") {
@@ -761,7 +902,7 @@ func dynamicGraphWorker(ctx context.Context, client *redis.Client, config Config
 	}
 }
 
-func queryWorker(ctx context.Context, masterClient *redis.Client, replicaClients []*redis.Client, replicaAddrs []string, allowedReplicas []string, config Config, workerID int, done chan struct{}) {
+func queryWorker(ctx context.Context, masterClient *redis.Client, replicaClients []*redis.Client, replicaAddrs []string, allowedReplicas []string, config Config, workerID int, cancel context.CancelFunc, done chan struct{}) {
 	ticker := time.NewTicker(config.QueryInterval)
 	defer ticker.Stop()
 
@@ -796,20 +937,16 @@ func queryWorker(ctx context.Context, masterClient *redis.Client, replicaClients
 	// More intensive than before but still bounded to avoid timeouts
 	// Avoiding multi-hop paths to prevent exponential complexity
 	queries := []string{
-		"MATCH (n)-[r]->(m) WHERE n._updated > 0 AND m._updated > 0 RETURN count(r) LIMIT 100",         // Multi-condition filter
-		"MATCH (n) WHERE n._updated > 0 RETURN count(n)",                                               // Filtered node count
-		"MATCH (n)-[r]->(m) WHERE id(n) < id(m) RETURN count(r) LIMIT 100",                             // ID-based filtering
-		"MATCH (n)-[r]->(m) WHERE n._updated > 0 RETURN n, m, r ORDER BY n._updated LIMIT 50",          // Return with sorting
-		"MATCH (n)-[r]->(m) WHERE n.name IS NOT NULL AND m.name IS NOT NULL RETURN count(r) LIMIT 200", // Property existence checks
-		"MATCH (n) WHERE n._updated > 0 RETURN n.name, n._updated ORDER BY n._updated DESC LIMIT 100",  // Property access with sorting
-		"MATCH (n)-[r]->(m) WHERE id(n) % 2 = 0 AND id(m) % 2 = 0 RETURN count(r) LIMIT 200",           // Multiple modulo filters
-		"MATCH (n)-[r]->(m) RETURN n, r, m LIMIT 50",                                                   // Return full patterns (more data transfer)
-		"MATCH (n) WHERE n._updated > 0 RETURN collect(n.name) LIMIT 1",                                // Aggregation with collection
-		"MATCH (n)-[r]->(m) WHERE n._updated > 0 RETURN distinct n.name LIMIT 100",                     // Distinct with property access
+		"MATCH (n)-[r]->(m) WHERE n._updated > 0 AND m._updated > 0 RETURN count(r) LIMIT 100",        // Multi-condition filter
+		"MATCH (n) WHERE n._updated > 0 RETURN n.name, n._updated ORDER BY n._updated DESC LIMIT 100", // Property access with sorting
+		"MATCH (n) WHERE n._updated > 0 RETURN collect(n.name) LIMIT 1",                               // Aggregation with collection
+		"MATCH (n)-[r]->(m) WHERE n._updated > 0 RETURN distinct n.name LIMIT 100",                    // Distinct with property access
 	}
 
 	for {
 		select {
+		case <-ctx.Done():
+			return
 		case <-done:
 			return
 		case <-ticker.C:
@@ -843,6 +980,10 @@ func queryWorker(ctx context.Context, masterClient *redis.Client, replicaClients
 			duration := time.Since(startTime)
 
 			if err != nil {
+				// Check if it's a connectivity error to master
+				if clientName == "master" && isMasterConnectivityError(err, config.MasterAddr) {
+					handleMasterConnectivityLoss(err, config.MasterAddr, cancel)
+				}
 				// Check if graph doesn't exist (that's okay for dynamic graphs - may have been deleted by another worker)
 				errStr := err.Error()
 				if strings.Contains(errStr, "not found") ||
@@ -861,12 +1002,14 @@ func queryWorker(ctx context.Context, masterClient *redis.Client, replicaClients
 	}
 }
 
-func gcGarbageWorker(ctx context.Context, client *redis.Client, config Config, workerID int, done chan struct{}) {
+func gcGarbageWorker(ctx context.Context, client *redis.Client, config Config, workerID int, cancel context.CancelFunc, done chan struct{}) {
 	ticker := time.NewTicker(config.GCGarbageInterval)
 	defer ticker.Stop()
 
 	for {
 		select {
+		case <-ctx.Done():
+			return
 		case <-done:
 			return
 		case <-ticker.C:
@@ -877,14 +1020,18 @@ func gcGarbageWorker(ctx context.Context, client *redis.Client, config Config, w
 			graphNum := rand.Intn(config.NumGraphs)
 			graphName := fmt.Sprintf("graph-%d", graphNum)
 
-			// Delete 25-50 nodes to create garbage for RediSearch GC
+			// Delete 50-75 nodes to create garbage for RediSearch GC
 			// Each node has 2 indexes (_updated and name), so deleting 1 node = 2 deleted docs
-			// To hit the 100-doc threshold, we need ~50 nodes deleted (creates 100 deleted docs)
+			// To reliably hit the 100-doc threshold, we need at least 50 nodes deleted (creates 100+ deleted docs)
 			// Use WITH ... LIMIT ... DELETE pattern (LIMIT must come before DELETE in Cypher)
-			deleteCount := 25 + rand.Intn(26) // Random between 25-50 nodes (creates 50-100 deleted docs)
+			deleteCount := 50 + rand.Intn(26) // Random between 50-75 nodes (creates 100-150 deleted docs)
+			deletedDocs := deleteCount * 2    // Each node has 2 indexed properties
 			deleteQuery := fmt.Sprintf("MATCH (n) WITH n LIMIT %d DELETE n", deleteCount)
 			_, err := client.Do(ctx, "GRAPH.QUERY", graphName, deleteQuery).Result()
 			if err != nil {
+				if isMasterConnectivityError(err, config.MasterAddr) {
+					handleMasterConnectivityLoss(err, config.MasterAddr, cancel)
+				}
 				// Graph might not exist or have nodes, that's okay
 				errStr := err.Error()
 				if strings.Contains(errStr, "not found") ||
@@ -908,18 +1055,21 @@ func gcGarbageWorker(ctx context.Context, client *redis.Client, config Config, w
 				createQuery := fmt.Sprintf("CREATE (n:Node {name: '%s', _updated: %d})", nodeName, now)
 				_, err := client.Do(ctx, "GRAPH.QUERY", graphName, createQuery).Result()
 				if err != nil {
+					if isMasterConnectivityError(err, config.MasterAddr) {
+						handleMasterConnectivityLoss(err, config.MasterAddr, cancel)
+					}
 					// Log but continue - some failures are expected
 					log.Printf("GC garbage worker %d: Failed to recreate node in %s: %v", workerID, graphName, err)
 					break
 				}
 			}
 
-			log.Printf("GC garbage worker %d: Deleted and recreated nodes in %s (creates garbage for RediSearch GC)", workerID, graphName)
+			log.Printf("GC garbage worker %d: Deleted %d nodes (%d deleted docs) and recreated in %s - should trigger RediSearch GC", workerID, deleteCount, deletedDocs, graphName)
 		}
 	}
 }
 
-func bgsaveWorker(ctx context.Context, masterClient *redis.Client, replicaClients []*redis.Client, config Config, done chan struct{}) {
+func bgsaveWorker(ctx context.Context, masterClient *redis.Client, replicaClients []*redis.Client, config Config, cancel context.CancelFunc, done chan struct{}) {
 	ticker := time.NewTicker(config.BGSAVEInterval)
 	defer ticker.Stop()
 
@@ -931,6 +1081,10 @@ func bgsaveWorker(ctx context.Context, masterClient *redis.Client, replicaClient
 	// Helper function to handle BGSAVE result for an instance
 	handleBGSaveResult := func(instanceName string, result interface{}, err error) {
 		if err != nil {
+			// Check for connectivity errors to master
+			if instanceName == "master" && isMasterConnectivityError(err, config.MasterAddr) {
+				handleMasterConnectivityLoss(err, config.MasterAddr, cancel)
+			}
 			errStr := err.Error()
 			// Check for "can't BGSAVE right now" - this indicates a child process is blocking BGSAVE
 			if strings.Contains(errStr, "can't BGSAVE right now") || strings.Contains(errStr, "Another child process is active") {
@@ -964,6 +1118,8 @@ func bgsaveWorker(ctx context.Context, masterClient *redis.Client, replicaClient
 
 	for {
 		select {
+		case <-ctx.Done():
+			return
 		case <-done:
 			return
 		case <-ticker.C:
@@ -992,6 +1148,77 @@ func bgsaveWorker(ctx context.Context, masterClient *redis.Client, replicaClient
 	}
 }
 
+// gcMonitorWorker periodically checks Redis INFO for RediSearch GC activity
+// This helps track when GC is actually running (which creates the thread-pool-0 zombie)
+func gcMonitorWorker(ctx context.Context, masterClient *redis.Client, config Config, cancel context.CancelFunc, done chan struct{}) {
+	ticker := time.NewTicker(60 * time.Second) // Check every 60 seconds
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-done:
+			return
+		case <-ticker.C:
+			// Get Redis INFO from multiple sections to check for RediSearch/GC statistics
+			// Check "all" section first for comprehensive info
+			infoAll, err := masterClient.Info(ctx, "all").Result()
+			if err != nil {
+				if isMasterConnectivityError(err, config.MasterAddr) {
+					handleMasterConnectivityLoss(err, config.MasterAddr, cancel)
+				}
+				// Silently continue on other errors
+				continue
+			}
+
+			// Also check modules section specifically
+			infoModules, err := masterClient.Info(ctx, "modules").Result()
+			if err == nil {
+				infoAll += "\n" + infoModules
+			}
+
+			// Look for RediSearch GC indicators in the INFO output
+			// RediSearch typically reports GC stats in various sections
+			lines := strings.Split(infoAll, "\n")
+			gcFound := false
+			for _, line := range lines {
+				lineLower := strings.ToLower(strings.TrimSpace(line))
+				// Look for GC-related keywords
+				if strings.Contains(lineLower, "gc") ||
+					strings.Contains(lineLower, "garbage") ||
+					strings.Contains(lineLower, "search_gc") ||
+					strings.Contains(lineLower, "fork_gc") ||
+					strings.Contains(lineLower, "thread-pool") {
+					log.Printf("🔍 GC Monitor: %s", strings.TrimSpace(line))
+					gcFound = true
+				}
+			}
+			// Log summary if GC activity was detected
+			if gcFound {
+				log.Printf("🔍 GC Monitor: RediSearch GC activity detected in INFO output")
+			}
+
+			// Try to query RediSearch directly for index info (which might show GC activity)
+			// Query a sample graph's index to see if we can detect GC-related info
+			if rand.Float32() < 0.1 { // Only check occasionally (10% of the time) to avoid spam
+				graphName := fmt.Sprintf("graph-%d", rand.Intn(config.NumGraphs))
+				// Try FT.INFO on the graph's index if it exists
+				// Note: This is a best-effort check, may not work depending on RedisGraph version
+				_, err := masterClient.Do(ctx, "FT.INFO", graphName).Result()
+				if err == nil {
+					// If FT.INFO succeeds, we might be able to extract GC-related stats
+					// For now, just log that we checked
+				}
+			}
+
+			// Also check for background processes that might indicate GC is running
+			// The thread-pool-0 zombie appears when GC forks a child process
+			// We can't directly detect this from Redis, but verbose logging should show it
+		}
+	}
+}
+
 func main() {
 	config := getConfig()
 	log.Printf("Starting BGSAVE hang test driver")
@@ -1006,7 +1233,8 @@ func main() {
 	log.Printf("Config: Master=%s, Replicas=%s, QueryReplicas=%s, Graphs=%d, NodesPerGraph=%d, UpdateWorkers=%d, DynamicGraphWorkers=%d, QueryWorkers=%d, GCGarbageWorkers=%d, JitterMaxMs=%d, UpdateInterval=%v, DynamicGraphInterval=%v, QueryInterval=%v, GCGarbageInterval=%v, BGSAVEInterval=%v",
 		config.MasterAddr, replicaInfo, queryReplicasInfo, config.NumGraphs, config.TargetNodesPerGraph, config.NumUpdateWorkers, config.NumDynamicGraphWorkers, config.NumQueryWorkers, config.NumGCGarbageWorkers, config.JitterMaxMs, config.UpdateInterval, config.DynamicGraphInterval, config.QueryInterval, config.GCGarbageInterval, config.BGSAVEInterval)
 
-	ctx := context.Background()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
 	// Create Redis clients
 	masterClient := createRedisClient(config.MasterAddr)
@@ -1065,11 +1293,11 @@ func main() {
 	done := make(chan struct{})
 	// Start multiple update workers for concurrent updates
 	for i := 0; i < config.NumUpdateWorkers; i++ {
-		go updateWorker(ctx, masterClient, config, done)
+		go updateWorker(ctx, masterClient, config, cancel, done)
 	}
 	// Start dynamic graph workers for create/delete operations
 	for i := 0; i < config.NumDynamicGraphWorkers; i++ {
-		go dynamicGraphWorker(ctx, masterClient, config, done)
+		go dynamicGraphWorker(ctx, masterClient, config, cancel, done)
 	}
 	// Build slice of replica clients and their addresses
 	replicaClients := []*redis.Client{replicaClient}
@@ -1081,20 +1309,30 @@ func main() {
 
 	// Start query workers for graph-walking queries
 	for i := 0; i < config.NumQueryWorkers; i++ {
-		go queryWorker(ctx, masterClient, replicaClients, replicaAddrs, config.QueryReplicas, config, i, done)
+		go queryWorker(ctx, masterClient, replicaClients, replicaAddrs, config.QueryReplicas, config, i, cancel, done)
 	}
 	// Start GC garbage workers to create deleted documents for RediSearch GC
 	for i := 0; i < config.NumGCGarbageWorkers; i++ {
-		go gcGarbageWorker(ctx, masterClient, config, i, done)
+		go gcGarbageWorker(ctx, masterClient, config, i, cancel, done)
 	}
-	go bgsaveWorker(ctx, masterClient, replicaClients, config, done)
+	go bgsaveWorker(ctx, masterClient, replicaClients, config, cancel, done)
+	// Start GC monitor to track RediSearch GC activity
+	go gcMonitorWorker(ctx, masterClient, config, cancel, done)
 
 	log.Printf("Stress test running. Press Ctrl+C to stop.")
 
-	// Wait for interrupt
-	<-sigChan
-	log.Printf("Shutting down...")
-	close(done)
-	time.Sleep(1 * time.Second)
-	log.Printf("Test driver stopped")
+	// Wait for interrupt or context cancellation
+	select {
+	case <-sigChan:
+		log.Printf("Shutting down...")
+		cancel()
+		close(done)
+		time.Sleep(1 * time.Second)
+		log.Printf("Test driver stopped")
+	case <-ctx.Done():
+		log.Printf("Shutting down due to master connectivity loss...")
+		close(done)
+		time.Sleep(1 * time.Second)
+		log.Printf("Test driver stopped")
+	}
 }
