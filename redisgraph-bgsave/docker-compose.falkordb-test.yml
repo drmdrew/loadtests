@@ -1,0 +1,133 @@
+services:
+  falkordb-master:
+    image: falkordb/falkordb:v4.14.8
+    container_name: falkordb-master
+    restart: unless-stopped
+    # Ports removed - services communicate via internal network
+    # Uncomment if you need external access:
+    # ports:
+    #   - "16379:6379"
+    volumes:
+      - falkordb-master-data:/data
+    networks:
+      - falkordb-test-network
+    cap_add:
+      - SYS_PTRACE  # Enable ptrace for debugging (gdb, strace, etc.)
+    environment:
+      - BROWSER=0
+      - REDIS_ARGS=--dir /data --save 900 1 --loglevel verbose
+      - FALKORDB_ARGS=THREAD_COUNT 32
+    healthcheck:
+      # Readiness: Check Redis is responding (with timeout to prevent hanging)
+      # Increased retries to allow observation of hangs (race condition testing)
+      test: ["CMD-SHELL", "timeout 10s redis-cli ping"]
+      interval: 5s
+      timeout: 10s
+      retries: 30
+      start_period: 10s
+
+  falkordb-replica:
+    image: falkordb/falkordb:v4.14.8
+    container_name: falkordb-replica
+    restart: unless-stopped
+    # Ports removed - services communicate via internal network
+    # Uncomment if you need external access:
+    # ports:
+    #   - "16380:6379"
+    volumes:
+      - falkordb-replica-data:/data
+    networks:
+      - falkordb-test-network
+    cap_add:
+      - SYS_PTRACE  # Enable ptrace for debugging (gdb, strace, etc.)
+    environment:
+      - BROWSER=0
+      - REDIS_ARGS=--dir /data --save 900 1 --loglevel verbose --replicaof falkordb-master 6379
+      - FALKORDB_ARGS=THREAD_COUNT 32
+    depends_on:
+      falkordb-master:
+        condition: service_healthy
+    healthcheck:
+      # Readiness: Check Redis is responding (with timeout to prevent hanging)
+      # Increased retries to allow observation of hangs (race condition testing)
+      test: ["CMD-SHELL", "timeout 10s redis-cli ping"]
+      interval: 5s
+      timeout: 10s
+      retries: 30
+      start_period: 10s
+
+  falkordb-replica2:
+    image: falkordb/falkordb:v4.14.8
+    container_name: falkordb-replica2
+    restart: unless-stopped
+    # Ports removed - services communicate via internal network
+    # Uncomment if you need external access:
+    # ports:
+    #   - "16381:6379"
+    volumes:
+      - falkordb-replica2-data:/data
+    networks:
+      - falkordb-test-network
+    cap_add:
+      - SYS_PTRACE  # Enable ptrace for debugging (gdb, strace, etc.)
+    environment:
+      - BROWSER=0
+      - REDIS_ARGS=--dir /data --save 900 1 --loglevel verbose --replicaof falkordb-master 6379
+      - FALKORDB_ARGS=THREAD_COUNT 32
+    depends_on:
+      falkordb-master:
+        condition: service_healthy
+    healthcheck:
+      # Readiness: Check Redis is responding (with timeout to prevent hanging)
+      # Increased retries to allow observation of hangs (race condition testing)
+      test: ["CMD-SHELL", "timeout 10s redis-cli ping"]
+      interval: 5s
+      timeout: 10s
+      retries: 30
+      start_period: 10s
+
+  falkordb-testdriver:
+    build:
+      context: ./tester
+      dockerfile: Dockerfile
+    container_name: falkordb-testdriver
+    restart: unless-stopped
+    networks:
+      - falkordb-test-network
+    environment:
+      - REDIS_MASTER=falkordb-master:6379
+      - REDIS_REPLICA=falkordb-replica:6379
+      - REDIS_REPLICA2=falkordb-replica2:6379
+      - QUERY_REPLICAS=falkordb-replica:6379 # ,falkordb-replica2:6379
+      - SIMPLE_SEED_ONLY=false
+      - NUM_GRAPHS=25
+      - TARGET_NODES_PER_GRAPH=100
+      - JITTER_MAX_MS=200
+      - UPDATE_INTERVAL=1s
+      - DYNAMIC_GRAPH_INTERVAL=500ms
+      - QUERY_INTERVAL=500ms
+      - GC_GARBAGE_INTERVAL=1s
+      - BGSAVE_INTERVAL=15s
+      - NUM_DYNAMIC_GRAPH_WORKERS=2
+      - NUM_UPDATE_WORKERS=2
+      - NUM_QUERY_WORKERS=12
+      - NUM_GC_GARBAGE_WORKERS=2
+    depends_on:
+      falkordb-master:
+        condition: service_healthy
+      falkordb-replica:
+        condition: service_healthy
+      falkordb-replica2:
+        condition: service_healthy
+    stdin_open: true
+    tty: true
+
+volumes:
+  falkordb-master-data:
+  falkordb-replica-data:
+  falkordb-replica2-data:
+
+networks:
+  falkordb-test-network:
+    driver: bridge
+
