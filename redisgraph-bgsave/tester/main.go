@@ -948,7 +948,7 @@ func queryWorker(ctx context.Context, masterClient *redis.Client, replicaClients
 		// Intensive query with sorting and aggregations (~1s)
 		"MATCH (n)-[r]->(m) WHERE n._updated > 0 AND m._updated > 0 WITH n, m, r ORDER BY n._updated DESC, m._updated DESC RETURN collect(DISTINCT n.name)[0..200], count(r), max(n._updated), min(m._updated) LIMIT 1",
 		// Very intensive query with multiple stages, large collections, and complex aggregations (~2-4s)
-		"MATCH (n)-[r]->(m) WHERE n._updated > 0 AND m._updated > 0 WITH n, m, r ORDER BY n._updated DESC, m._updated DESC, id(n) DESC WITH collect(DISTINCT n.name)[0..400] as names, collect(DISTINCT m.name)[0..400] as mNames, count(r) as relCount, collect(r)[0..300] as rels WITH names, mNames, relCount, rels, size(names) as nameCount, size(mNames) as mNameCount ORDER BY nameCount DESC, mNameCount DESC RETURN names[0..300], mNames[0..300], relCount, size(rels), max([x in names | size(x)]), min([x in mNames | size(x)]) LIMIT 1",
+		// "MATCH (n)-[r]->(m) WHERE n._updated > 0 AND m._updated > 0 WITH n, m, r ORDER BY n._updated DESC, m._updated DESC, id(n) DESC WITH collect(DISTINCT n.name)[0..400] as names, collect(DISTINCT m.name)[0..400] as mNames, count(r) as relCount, collect(r)[0..300] as rels WITH names, mNames, relCount, rels, size(names) as nameCount, size(mNames) as mNameCount ORDER BY nameCount DESC, mNameCount DESC RETURN names[0..300], mNames[0..300], relCount, size(rels), max([x in names | size(x)]), min([x in mNames | size(x)]) LIMIT 1",
 	}
 
 	for {
