@@ -99,9 +99,10 @@ services:
       - REDIS_REPLICA=falkordb-replica:6379
       - REDIS_REPLICA2=falkordb-replica2:6379
       - QUERY_REPLICAS=falkordb-replica:6379 # ,falkordb-replica2:6379
+      - EXIT_ON_MASTER_LOSS=false
       - SIMPLE_SEED_ONLY=false
       - NUM_GRAPHS=25
-      - TARGET_NODES_PER_GRAPH=100
+      - TARGET_NODES_PER_GRAPH=200
       - JITTER_MAX_MS=200
       - UPDATE_INTERVAL=1s
       - DYNAMIC_GRAPH_INTERVAL=500ms

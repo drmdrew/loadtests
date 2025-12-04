@@ -35,6 +35,7 @@ type Config struct {
 	GCGarbageInterval      time.Duration // Interval for GC garbage operations
 	BGSAVEInterval         time.Duration
 	SimpleSeedOnly         bool // If true, only create one node per graph (for testing)
+	ExitOnMasterLoss       bool // If false, don't exit on master connectivity loss (for debugging)
 }
 
 func getConfig() Config {
@@ -156,6 +157,13 @@ func getConfig() Config {
 		}
 	}
 
+	exitOnMasterLoss := true // Default to exiting on master loss
+	if e := os.Getenv("EXIT_ON_MASTER_LOSS"); e != "" {
+		if parsed, err := strconv.ParseBool(e); err == nil {
+			exitOnMasterLoss = parsed
+		}
+	}
+
 	return Config{
 		MasterAddr:             master,
 		ReplicaAddr:            replica,
@@ -174,6 +182,7 @@ func getConfig() Config {
 		GCGarbageInterval:      gcGarbageInterval,
 		BGSAVEInterval:         bgsaveInterval,
 		SimpleSeedOnly:         simpleSeedOnly,
+		ExitOnMasterLoss:       exitOnMasterLoss,
 	}
 }
 
@@ -238,21 +247,29 @@ func isMasterConnectivityError(err error, masterAddr string) bool {
 	return false
 }
 
-// handleMasterConnectivityLoss logs the error and exits immediately when master connectivity is lost
-func handleMasterConnectivityLoss(err error, masterAddr string, cancel context.CancelFunc) {
-	log.Printf("FATAL: Lost contact with master (%s): %v. Exiting...", masterAddr, err)
-	cancel()
-	// Give a brief moment for the log to flush, then exit
-	time.Sleep(100 * time.Millisecond)
-	os.Exit(1)
+// handleMasterConnectivityLoss logs the error and optionally exits when master connectivity is lost
+func handleMasterConnectivityLoss(err error, masterAddr string, config Config, cancel context.CancelFunc) {
+	if config.ExitOnMasterLoss {
+		log.Printf("FATAL: Lost contact with master (%s): %v. Exiting...", masterAddr, err)
+		cancel()
+		// Give a brief moment for the log to flush, then exit
+		time.Sleep(100 * time.Millisecond)
+		os.Exit(1)
+	} else {
+		log.Printf("WARNING: Lost contact with master (%s): %v. Continuing (EXIT_ON_MASTER_LOSS=false)...", masterAddr, err)
+	}
 }
 
-// exitOnMasterConnectivityLoss logs the error and exits immediately when master connectivity is lost
+// exitOnMasterConnectivityLoss logs the error and optionally exits when master connectivity is lost
 // Used during initialization when cancel context is not available
-func exitOnMasterConnectivityLoss(err error, masterAddr string) {
-	log.Printf("FATAL: Lost contact with master (%s): %v. Exiting...", masterAddr, err)
-	time.Sleep(100 * time.Millisecond)
-	os.Exit(1)
+func exitOnMasterConnectivityLoss(err error, masterAddr string, config Config) {
+	if config.ExitOnMasterLoss {
+		log.Printf("FATAL: Lost contact with master (%s): %v. Exiting...", masterAddr, err)
+		time.Sleep(100 * time.Millisecond)
+		os.Exit(1)
+	} else {
+		log.Printf("WARNING: Lost contact with master (%s): %v. Continuing (EXIT_ON_MASTER_LOSS=false)...", masterAddr, err)
+	}
 }
 
 func graphExists(ctx context.Context, client *redis.Client, graphName string) (bool, error) {
@@ -464,7 +481,7 @@ func ensureGraphsPopulated(ctx context.Context, masterClient *redis.Client, conf
 		if err != nil {
 			if isMasterConnectivityError(err, config.MasterAddr) {
 				log.Printf("FATAL: Lost contact with master (%s): %v. Exiting...", config.MasterAddr, err)
-				exitOnMasterConnectivityLoss(err, config.MasterAddr)
+				exitOnMasterConnectivityLoss(err, config.MasterAddr, config)
 			}
 			log.Printf("Error checking graph %s: %v", graphName, err)
 			continue
@@ -476,7 +493,7 @@ func ensureGraphsPopulated(ctx context.Context, masterClient *redis.Client, conf
 				if err := simpleSeedGraph(ctx, masterClient, graphName); err != nil {
 					if isMasterConnectivityError(err, config.MasterAddr) {
 						log.Printf("FATAL: Lost contact with master (%s): %v. Exiting...", config.MasterAddr, err)
-						exitOnMasterConnectivityLoss(err, config.MasterAddr)
+						exitOnMasterConnectivityLoss(err, config.MasterAddr, config)
 					}
 					log.Printf("Failed to seed graph %s: %v", graphName, err)
 					return fmt.Errorf("failed to seed graph %s: %w", graphName, err)
@@ -487,7 +504,7 @@ func ensureGraphsPopulated(ctx context.Context, masterClient *redis.Client, conf
 				if err := populateGraph(ctx, masterClient, graphName, config.TargetNodesPerGraph); err != nil {
 					if isMasterConnectivityError(err, config.MasterAddr) {
 						log.Printf("FATAL: Lost contact with master (%s): %v. Exiting...", config.MasterAddr, err)
-						exitOnMasterConnectivityLoss(err, config.MasterAddr)
+						exitOnMasterConnectivityLoss(err, config.MasterAddr, config)
 					}
 					log.Printf("Failed to populate graph %s: %v", graphName, err)
 					return fmt.Errorf("failed to populate graph %s: %w", graphName, err)
@@ -505,7 +522,7 @@ func ensureGraphsPopulated(ctx context.Context, masterClient *redis.Client, conf
 						if err := simpleSeedGraph(ctx, masterClient, graphName); err != nil {
 							if isMasterConnectivityError(err, config.MasterAddr) {
 								log.Printf("FATAL: Lost contact with master (%s): %v. Exiting...", config.MasterAddr, err)
-								exitOnMasterConnectivityLoss(err, config.MasterAddr)
+								exitOnMasterConnectivityLoss(err, config.MasterAddr, config)
 							}
 							log.Printf("Failed to reseed graph %s: %v", graphName, err)
 						}
@@ -520,7 +537,7 @@ func ensureGraphsPopulated(ctx context.Context, masterClient *redis.Client, conf
 						if err := populateGraph(ctx, masterClient, graphName, config.TargetNodesPerGraph); err != nil {
 							if isMasterConnectivityError(err, config.MasterAddr) {
 								log.Printf("FATAL: Lost contact with master (%s): %v. Exiting...", config.MasterAddr, err)
-								exitOnMasterConnectivityLoss(err, config.MasterAddr)
+								exitOnMasterConnectivityLoss(err, config.MasterAddr, config)
 							}
 							log.Printf("Failed to repopulate graph %s: %v", graphName, err)
 						}
@@ -541,7 +558,7 @@ func ensureGraphsPopulated(ctx context.Context, masterClient *redis.Client, conf
 		if err != nil {
 			if isMasterConnectivityError(err, config.MasterAddr) {
 				log.Printf("FATAL: Lost contact with master (%s): %v. Exiting...", config.MasterAddr, err)
-				exitOnMasterConnectivityLoss(err, config.MasterAddr)
+				exitOnMasterConnectivityLoss(err, config.MasterAddr, config)
 			}
 			log.Printf("Error checking dynamic graph %s: %v", graphName, err)
 			continue
@@ -553,7 +570,7 @@ func ensureGraphsPopulated(ctx context.Context, masterClient *redis.Client, conf
 				if err := simpleSeedGraph(ctx, masterClient, graphName); err != nil {
 					if isMasterConnectivityError(err, config.MasterAddr) {
 						log.Printf("FATAL: Lost contact with master (%s): %v. Exiting...", config.MasterAddr, err)
-						exitOnMasterConnectivityLoss(err, config.MasterAddr)
+						exitOnMasterConnectivityLoss(err, config.MasterAddr, config)
 					}
 					log.Printf("Failed to seed dynamic graph %s: %v", graphName, err)
 					// Don't fail completely, just log and continue
@@ -564,7 +581,7 @@ func ensureGraphsPopulated(ctx context.Context, masterClient *redis.Client, conf
 				if err := populateGraph(ctx, masterClient, graphName, config.TargetNodesPerGraph); err != nil {
 					if isMasterConnectivityError(err, config.MasterAddr) {
 						log.Printf("FATAL: Lost contact with master (%s): %v. Exiting...", config.MasterAddr, err)
-						exitOnMasterConnectivityLoss(err, config.MasterAddr)
+						exitOnMasterConnectivityLoss(err, config.MasterAddr, config)
 					}
 					log.Printf("Failed to populate dynamic graph %s: %v", graphName, err)
 					// Don't fail completely, just log and continue
@@ -575,7 +592,7 @@ func ensureGraphsPopulated(ctx context.Context, masterClient *redis.Client, conf
 			if err != nil {
 				if isMasterConnectivityError(err, config.MasterAddr) {
 					log.Printf("FATAL: Lost contact with master (%s): %v. Exiting...", config.MasterAddr, err)
-					exitOnMasterConnectivityLoss(err, config.MasterAddr)
+					exitOnMasterConnectivityLoss(err, config.MasterAddr, config)
 				}
 				log.Printf("Warning: could not get node count for %s: %v", graphName, err)
 			} else {
@@ -586,7 +603,7 @@ func ensureGraphsPopulated(ctx context.Context, masterClient *redis.Client, conf
 						if err := simpleSeedGraph(ctx, masterClient, graphName); err != nil {
 							if isMasterConnectivityError(err, config.MasterAddr) {
 								log.Printf("FATAL: Lost contact with master (%s): %v. Exiting...", config.MasterAddr, err)
-								exitOnMasterConnectivityLoss(err, config.MasterAddr)
+								exitOnMasterConnectivityLoss(err, config.MasterAddr, config)
 							}
 							log.Printf("Failed to reseed dynamic graph %s: %v", graphName, err)
 						}
@@ -601,7 +618,7 @@ func ensureGraphsPopulated(ctx context.Context, masterClient *redis.Client, conf
 						if err := populateGraph(ctx, masterClient, graphName, config.TargetNodesPerGraph); err != nil {
 							if isMasterConnectivityError(err, config.MasterAddr) {
 								log.Printf("FATAL: Lost contact with master (%s): %v. Exiting...", config.MasterAddr, err)
-								exitOnMasterConnectivityLoss(err, config.MasterAddr)
+								exitOnMasterConnectivityLoss(err, config.MasterAddr, config)
 							}
 							log.Printf("Failed to repopulate dynamic graph %s: %v", graphName, err)
 						}
@@ -733,7 +750,7 @@ func updateWorker(ctx context.Context, client *redis.Client, config Config, canc
 			_, err := client.Do(ctx, "GRAPH.QUERY", graphName, updateNodesQuery).Result()
 			if err != nil {
 				if isMasterConnectivityError(err, config.MasterAddr) {
-					handleMasterConnectivityLoss(err, config.MasterAddr, cancel)
+					handleMasterConnectivityLoss(err, config.MasterAddr, config, cancel)
 				}
 				log.Printf("Update nodes failed for %s: %v", graphName, err)
 				continue
@@ -747,7 +764,7 @@ func updateWorker(ctx context.Context, client *redis.Client, config Config, canc
 				_, err2 := client.Do(ctx, "GRAPH.QUERY", graphName, updateRelsQuery).Result()
 				if err2 != nil {
 					if isMasterConnectivityError(err2, config.MasterAddr) {
-						handleMasterConnectivityLoss(err2, config.MasterAddr, cancel)
+						handleMasterConnectivityLoss(err2, config.MasterAddr, config, cancel)
 					}
 					// It's okay if there are no relationships, just log it
 					log.Printf("Update relationships failed for %s (may have no relationships): %v", graphName, err2)
@@ -758,7 +775,7 @@ func updateWorker(ctx context.Context, client *redis.Client, config Config, canc
 				_, err2 := client.Do(ctx, "GRAPH.QUERY", graphName, updateRelsQuery).Result()
 				if err2 != nil {
 					if isMasterConnectivityError(err2, config.MasterAddr) {
-						handleMasterConnectivityLoss(err2, config.MasterAddr, cancel)
+						handleMasterConnectivityLoss(err2, config.MasterAddr, config, cancel)
 					}
 					// It's okay if there are no relationships, just log it
 					log.Printf("Update relationships failed for %s (may have no relationships): %v", graphName, err2)
@@ -803,7 +820,7 @@ func dynamicGraphWorker(ctx context.Context, client *redis.Client, config Config
 
 			if err != nil {
 				if isMasterConnectivityError(err, config.MasterAddr) {
-					handleMasterConnectivityLoss(err, config.MasterAddr, cancel)
+					handleMasterConnectivityLoss(err, config.MasterAddr, config, cancel)
 				}
 				log.Printf("Warning: GRAPH.LIST failed: %v, falling back to random selection", err)
 				// Fallback to random selection if GRAPH.LIST fails
@@ -842,7 +859,7 @@ func dynamicGraphWorker(ctx context.Context, client *redis.Client, config Config
 			deleted, err := client.Del(ctx, graphName).Result()
 			if err != nil {
 				if isMasterConnectivityError(err, config.MasterAddr) {
-					handleMasterConnectivityLoss(err, config.MasterAddr, cancel)
+					handleMasterConnectivityLoss(err, config.MasterAddr, config, cancel)
 				}
 				// Check if it's a "graph doesn't exist" error (expected when another worker deleted it)
 				errStr := err.Error()
@@ -870,7 +887,7 @@ func dynamicGraphWorker(ctx context.Context, client *redis.Client, config Config
 			if config.SimpleSeedOnly {
 				if err := simpleSeedGraph(ctx, client, graphName); err != nil {
 					if isMasterConnectivityError(err, config.MasterAddr) {
-						handleMasterConnectivityLoss(err, config.MasterAddr, cancel)
+						handleMasterConnectivityLoss(err, config.MasterAddr, config, cancel)
 					}
 					// Check if it's a transient error (graph might have been recreated by another worker)
 					errStr := err.Error()
@@ -885,7 +902,7 @@ func dynamicGraphWorker(ctx context.Context, client *redis.Client, config Config
 			} else {
 				if err := populateGraph(ctx, client, graphName, config.TargetNodesPerGraph); err != nil {
 					if isMasterConnectivityError(err, config.MasterAddr) {
-						handleMasterConnectivityLoss(err, config.MasterAddr, cancel)
+						handleMasterConnectivityLoss(err, config.MasterAddr, config, cancel)
 					}
 					// Check if it's a transient error (graph might have been recreated by another worker)
 					errStr := err.Error()
@@ -946,7 +963,7 @@ func queryWorker(ctx context.Context, masterClient *redis.Client, replicaClients
 		// Distinct with property access
 		"MATCH (n)-[r]->(m) WHERE n._updated > 0 RETURN distinct n.name LIMIT 100",
 		// Intensive query with sorting and aggregations (~1s)
-		"MATCH (n)-[r]->(m) WHERE n._updated > 0 AND m._updated > 0 WITH n, m, r ORDER BY n._updated DESC, m._updated DESC RETURN collect(DISTINCT n.name)[0..200], count(r), max(n._updated), min(m._updated) LIMIT 1",
+		// "MATCH (n)-[r]->(m) WHERE n._updated > 0 AND m._updated > 0 WITH n, m, r ORDER BY n._updated DESC, m._updated DESC RETURN collect(DISTINCT n.name)[0..200], count(r), max(n._updated), min(m._updated) LIMIT 1",
 		// Very intensive query with multiple stages, large collections, and complex aggregations (~2-4s)
 		// "MATCH (n)-[r]->(m) WHERE n._updated > 0 AND m._updated > 0 WITH n, m, r ORDER BY n._updated DESC, m._updated DESC, id(n) DESC WITH collect(DISTINCT n.name)[0..400] as names, collect(DISTINCT m.name)[0..400] as mNames, count(r) as relCount, collect(r)[0..300] as rels WITH names, mNames, relCount, rels, size(names) as nameCount, size(mNames) as mNameCount ORDER BY nameCount DESC, mNameCount DESC RETURN names[0..300], mNames[0..300], relCount, size(rels), max([x in names | size(x)]), min([x in mNames | size(x)]) LIMIT 1",
 	}
@@ -990,7 +1007,7 @@ func queryWorker(ctx context.Context, masterClient *redis.Client, replicaClients
 			if err != nil {
 				// Check if it's a connectivity error to master
 				if clientName == "master" && isMasterConnectivityError(err, config.MasterAddr) {
-					handleMasterConnectivityLoss(err, config.MasterAddr, cancel)
+					handleMasterConnectivityLoss(err, config.MasterAddr, config, cancel)
 				}
 				// Check if graph doesn't exist (that's okay for dynamic graphs - may have been deleted by another worker)
 				errStr := err.Error()
@@ -1038,7 +1055,7 @@ func gcGarbageWorker(ctx context.Context, client *redis.Client, config Config, w
 			_, err := client.Do(ctx, "GRAPH.QUERY", graphName, deleteQuery).Result()
 			if err != nil {
 				if isMasterConnectivityError(err, config.MasterAddr) {
-					handleMasterConnectivityLoss(err, config.MasterAddr, cancel)
+					handleMasterConnectivityLoss(err, config.MasterAddr, config, cancel)
 				}
 				// Graph might not exist or have nodes, that's okay
 				errStr := err.Error()
@@ -1064,7 +1081,7 @@ func gcGarbageWorker(ctx context.Context, client *redis.Client, config Config, w
 				_, err := client.Do(ctx, "GRAPH.QUERY", graphName, createQuery).Result()
 				if err != nil {
 					if isMasterConnectivityError(err, config.MasterAddr) {
-						handleMasterConnectivityLoss(err, config.MasterAddr, cancel)
+						handleMasterConnectivityLoss(err, config.MasterAddr, config, cancel)
 					}
 					// Log but continue - some failures are expected
 					log.Printf("GC garbage worker %d: Failed to recreate node in %s: %v", workerID, graphName, err)
@@ -1091,7 +1108,7 @@ func bgsaveWorker(ctx context.Context, masterClient *redis.Client, replicaClient
 		if err != nil {
 			// Check for connectivity errors to master
 			if instanceName == "master" && isMasterConnectivityError(err, config.MasterAddr) {
-				handleMasterConnectivityLoss(err, config.MasterAddr, cancel)
+				handleMasterConnectivityLoss(err, config.MasterAddr, config, cancel)
 			}
 			errStr := err.Error()
 			// Check for "can't BGSAVE right now" - this indicates a child process is blocking BGSAVE
@@ -1174,7 +1191,7 @@ func gcMonitorWorker(ctx context.Context, masterClient *redis.Client, config Con
 			infoAll, err := masterClient.Info(ctx, "all").Result()
 			if err != nil {
 				if isMasterConnectivityError(err, config.MasterAddr) {
-					handleMasterConnectivityLoss(err, config.MasterAddr, cancel)
+					handleMasterConnectivityLoss(err, config.MasterAddr, config, cancel)
 				}
 				// Silently continue on other errors
 				continue
