@@ -188,9 +188,12 @@ func getConfig() Config {
 
 func createRedisClient(addr string) *redis.Client {
 	return redis.NewClient(&redis.Options{
-		Addr:     addr,
-		Password: "",
-		DB:       0,
+		Addr:         addr,
+		Password:     "",
+		DB:           0,
+		DialTimeout:  10 * time.Second, // Timeout for establishing connections
+		ReadTimeout:  60 * time.Second, // Timeout for socket reads (increased for slow queries)
+		WriteTimeout: 10 * time.Second, // Timeout for socket writes
 	})
 }
 
@@ -947,9 +950,16 @@ func queryWorker(ctx context.Context, masterClient *redis.Client, replicaClients
 		}
 	}
 
-	// Query that visits all nodes and checks _created and/or _expired properties
-	// This should be slow enough (~1s) with 10000 nodes
-	nodePropertyQuery := "MATCH (n) RETURN n._created, n._expired, n.name, n._updated ORDER BY n._created"
+	// Array of queries that visit nodes and check _created and/or _expired properties
+	// Workers randomly select one query per iteration
+	queries := []string{
+		// Simple query: just visit all nodes and check properties
+		"MATCH (n) RETURN n._created, n._expired, n.name, n._updated ORDER BY n._created",
+		// Complex query: processes all nodes with their relationships to make it slower (~1s target)
+		"MATCH (n) OPTIONAL MATCH (n)-[r:NEXT|PREV]->(m) WITH n, collect({relType: type(r), neighborCreated: m._created, neighborExpired: m._expired, neighborName: m.name, neighborUpdated: m._updated}) as neighbors WHERE n._created IS NOT NULL OR n._expired IS NOT NULL OR size(neighbors) > 0 RETURN n._created, n._expired, n.name, n._updated, neighbors[0..1000] as neighborData ORDER BY n._created",
+		// Medium complexity: traverse relationships and check properties
+		"MATCH (n)-[r:NEXT|PREV]->(m) WHERE n._created IS NOT NULL OR n._expired IS NOT NULL OR m._created IS NOT NULL OR m._expired IS NOT NULL RETURN n._created, n._expired, n.name, n._updated, m._created, m._expired, m.name, m._updated, type(r) ORDER BY n._created, m._created",
+	}
 
 	for {
 		select {
@@ -965,6 +975,10 @@ func queryWorker(ctx context.Context, masterClient *redis.Client, replicaClients
 			selected := allowedClients[rand.Intn(len(allowedClients))]
 			client := selected.client
 			clientName := selected.name
+
+			// Randomly select a query from the array
+			queryIdx := rand.Intn(len(queries))
+			query := queries[queryIdx]
 
 			// Use GRAPH.LIST to get all graphs (this acquires read lock)
 			result, err := client.Do(ctx, "GRAPH.LIST").Result()
@@ -1003,12 +1017,12 @@ func queryWorker(ctx context.Context, masterClient *redis.Client, replicaClients
 				continue
 			}
 
-			// Walk through each graph and execute the query
+			// Walk through each graph and execute the selected query
 			for _, graphName := range graphsToQuery {
 				// Execute the query using GRAPH.RO_QUERY (read-only, works on both master and replica)
 				// This query visits all nodes and checks _created/_expired properties
 				startTime := time.Now()
-				_, err := client.Do(ctx, "GRAPH.RO_QUERY", graphName, nodePropertyQuery).Result()
+				_, err := client.Do(ctx, "GRAPH.RO_QUERY", graphName, query).Result()
 				duration := time.Since(startTime)
 
 				if err != nil {
@@ -1026,9 +1040,9 @@ func queryWorker(ctx context.Context, masterClient *redis.Client, replicaClients
 						// Graph doesn't exist, skip silently (expected for dynamic graphs)
 						continue
 					}
-					log.Printf("Query worker %d: Query failed on %s for %s (took %v): %v", workerID, clientName, graphName, duration, err)
+					log.Printf("Query worker %d: Query[%d] failed on %s for %s (took %v): %v", workerID, queryIdx, clientName, graphName, duration, err)
 				} else {
-					log.Printf("Query worker %d: Query executed on %s for %s (took %v)", workerID, clientName, graphName, duration)
+					log.Printf("Query worker %d: Query[%d] executed on %s for %s (took %v)", workerID, queryIdx, clientName, graphName, duration)
 				}
 			}
 		}

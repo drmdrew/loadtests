@@ -111,7 +111,7 @@ services:
       - BGSAVE_INTERVAL=5m
       - NUM_DYNAMIC_GRAPH_WORKERS=2
       - NUM_UPDATE_WORKERS=2
-      - NUM_QUERY_WORKERS=20
+      - NUM_QUERY_WORKERS=6
       - NUM_GC_GARBAGE_WORKERS=2
     depends_on:
       falkordb-master:
