@@ -371,9 +371,9 @@ func getNodeCount(ctx context.Context, client *redis.Client, graphName string) (
 func populateGraph(ctx context.Context, client *redis.Client, graphName string, targetNodes int) error {
 	log.Printf("Populating graph %s (target: %d nodes)", graphName, targetNodes)
 
-	// Step 1: Seed with one initial node
+	// Step 1: Seed with one initial node (node-0)
 	now := time.Now().Unix()
-	seedQuery := fmt.Sprintf("CREATE (n:Node {name: 'node-00', _updated: %d})", now)
+	seedQuery := fmt.Sprintf("CREATE (n:Node {name: 'node-0000', _created: %d, _updated: %d})", now, now)
 	result, err := client.Do(ctx, "GRAPH.QUERY", graphName, seedQuery).Result()
 	if err != nil {
 		return fmt.Errorf("failed to seed initial node: %w", err)
@@ -389,32 +389,29 @@ func populateGraph(ctx context.Context, client *redis.Client, graphName string, 
 		log.Printf("After seed, %s has %d nodes", graphName, seedCount)
 	}
 
-	// Step 2: Iteratively grow the graph
-	// In each iteration: connect all existing nodes, then add one new node
+	// Step 2: Iteratively grow the graph with double-linked list structure
+	// For each new node i: create node i, then link it to node i-1 with NEXT and PREV relationships
 	for i := 1; i < targetNodes; i++ {
-		// First, create relationships between all existing nodes
-		quadraticQuery := "MATCH (a), (b) CREATE (a)-[:REL]->(b)"
-		_, err := client.Do(ctx, "GRAPH.QUERY", graphName, quadraticQuery).Result()
-		if err != nil {
-			log.Printf("Warning: quadratic query failed for %s (iteration %d): %v", graphName, i, err)
-			// Continue anyway
-		}
-
-		// Then, add one new node with name and timestamp
-		nodeName := fmt.Sprintf("node-%02d", i)
 		now := time.Now().Unix()
-		createNodeQuery := fmt.Sprintf("CREATE (n:Node {name: '%s', _updated: %d})", nodeName, now)
-		result, err = client.Do(ctx, "GRAPH.QUERY", graphName, createNodeQuery).Result()
+		nodeName := fmt.Sprintf("node-%04d", i)
+		prevNodeName := fmt.Sprintf("node-%04d", i-1)
+
+		// Create new node and link it to the previous node in both directions
+		// This creates a double-linked list: (prev)-[:NEXT]->(current) and (current)-[:PREV]->(prev)
+		createNodeAndLinkQuery := fmt.Sprintf(
+			"MATCH (prev:Node {name: '%s'}) CREATE (n:Node {name: '%s', _created: %d, _updated: %d}), (prev)-[:NEXT]->(n), (n)-[:PREV]->(prev)",
+			prevNodeName, nodeName, now, now)
+		result, err = client.Do(ctx, "GRAPH.QUERY", graphName, createNodeAndLinkQuery).Result()
 		if err != nil {
-			log.Printf("Warning: Failed to create node %s in %s: %v", nodeName, graphName, err)
+			log.Printf("Warning: Failed to create node %s and link in %s: %v", nodeName, graphName, err)
 			// Continue anyway
-		} else if i%10 == 0 {
-			// Log progress every 10 nodes
+		} else if i%1000 == 0 {
+			// Log progress every 1000 nodes (since we have 10000 nodes now)
 			log.Printf("Created node %s in %s (progress: %d/%d)", nodeName, graphName, i+1, targetNodes)
 		}
 
 		// Small delay between iterations
-		time.Sleep(50 * time.Millisecond)
+		time.Sleep(10 * time.Millisecond)
 	}
 
 	// Verify final node count
@@ -435,7 +432,7 @@ func populateGraph(ctx context.Context, client *redis.Client, graphName string, 
 // simpleSeedGraph creates a single node in the graph - simple and reliable for testing
 func simpleSeedGraph(ctx context.Context, client *redis.Client, graphName string) error {
 	now := time.Now().Unix()
-	seedQuery := fmt.Sprintf("CREATE (n:Node {name: 'node-00', _updated: %d})", now)
+	seedQuery := fmt.Sprintf("CREATE (n:Node {name: 'node-00', _created: %d, _updated: %d})", now, now)
 
 	log.Printf("Seeding %s with single node...", graphName)
 	result, err := client.Do(ctx, "GRAPH.QUERY", graphName, seedQuery).Result()
@@ -950,23 +947,9 @@ func queryWorker(ctx context.Context, masterClient *redis.Client, replicaClients
 		}
 	}
 
-	// Predefined graph-walking queries that traverse relationships
-	// More intensive than before but still bounded to avoid timeouts
-	// Avoiding multi-hop paths to prevent exponential complexity
-	queries := []string{
-		// Multi-condition filter
-		"MATCH (n)-[r]->(m) WHERE n._updated > 0 AND m._updated > 0 RETURN count(r) LIMIT 100",
-		// Property access with sorting
-		"MATCH (n) WHERE n._updated > 0 RETURN n.name, n._updated ORDER BY n._updated DESC LIMIT 100",
-		// Aggregation with collection
-		"MATCH (n) WHERE n._updated > 0 RETURN collect(n.name) LIMIT 1",
-		// Distinct with property access
-		"MATCH (n)-[r]->(m) WHERE n._updated > 0 RETURN distinct n.name LIMIT 100",
-		// Intensive query with sorting and aggregations (~1s)
-		// "MATCH (n)-[r]->(m) WHERE n._updated > 0 AND m._updated > 0 WITH n, m, r ORDER BY n._updated DESC, m._updated DESC RETURN collect(DISTINCT n.name)[0..200], count(r), max(n._updated), min(m._updated) LIMIT 1",
-		// Very intensive query with multiple stages, large collections, and complex aggregations (~2-4s)
-		// "MATCH (n)-[r]->(m) WHERE n._updated > 0 AND m._updated > 0 WITH n, m, r ORDER BY n._updated DESC, m._updated DESC, id(n) DESC WITH collect(DISTINCT n.name)[0..400] as names, collect(DISTINCT m.name)[0..400] as mNames, count(r) as relCount, collect(r)[0..300] as rels WITH names, mNames, relCount, rels, size(names) as nameCount, size(mNames) as mNameCount ORDER BY nameCount DESC, mNameCount DESC RETURN names[0..300], mNames[0..300], relCount, size(rels), max([x in names | size(x)]), min([x in mNames | size(x)]) LIMIT 1",
-	}
+	// Query that visits all nodes and checks _created and/or _expired properties
+	// This should be slow enough (~1s) with 10000 nodes
+	nodePropertyQuery := "MATCH (n) RETURN n._created, n._expired, n.name, n._updated ORDER BY n._created"
 
 	for {
 		select {
@@ -983,45 +966,70 @@ func queryWorker(ctx context.Context, masterClient *redis.Client, replicaClients
 			client := selected.client
 			clientName := selected.name
 
-			// Randomly choose between regular graphs and dynamic graphs
-			var graphName string
-			if rand.Float32() < 0.5 {
-				// Regular graph
-				graphNum := rand.Intn(config.NumGraphs)
-				graphName = fmt.Sprintf("graph-%d", graphNum)
-			} else {
-				// Dynamic graph
-				graphNum := rand.Intn(config.NumGraphs)
-				graphName = fmt.Sprintf("dynamic-graph-%d", graphNum)
-			}
-
-			// Randomly select a query from our predefined set
-			queryIdx := rand.Intn(len(queries))
-			query := queries[queryIdx]
-
-			// Execute the query using GRAPH.RO_QUERY (read-only, works on both master and replica)
-			startTime := time.Now()
-			_, err := client.Do(ctx, "GRAPH.RO_QUERY", graphName, query).Result()
-			duration := time.Since(startTime)
-
+			// Use GRAPH.LIST to get all graphs (this acquires read lock)
+			result, err := client.Do(ctx, "GRAPH.LIST").Result()
 			if err != nil {
 				// Check if it's a connectivity error to master
 				if clientName == "master" && isMasterConnectivityError(err, config.MasterAddr) {
 					handleMasterConnectivityLoss(err, config.MasterAddr, config, cancel)
 				}
-				// Check if graph doesn't exist (that's okay for dynamic graphs - may have been deleted by another worker)
-				errStr := err.Error()
-				if strings.Contains(errStr, "not found") ||
-					strings.Contains(errStr, "does not exist") ||
-					strings.Contains(errStr, "Unknown graph") ||
-					strings.Contains(errStr, "empty key") ||
-					strings.Contains(errStr, "Invalid graph operation on empty key") {
-					// Graph doesn't exist, skip silently (expected for dynamic graphs)
-					continue
+				log.Printf("Query worker %d: GRAPH.LIST failed on %s: %v", workerID, clientName, err)
+				continue
+			}
+
+			// Parse GRAPH.LIST response (array of graph names)
+			graphList, ok := result.([]interface{})
+			if !ok {
+				log.Printf("Query worker %d: GRAPH.LIST returned unexpected type on %s", workerID, clientName)
+				continue
+			}
+
+			// Filter for regular graphs (graph-*) and optionally dynamic graphs
+			var graphsToQuery []string
+			for _, g := range graphList {
+				if name, ok := g.(string); ok {
+					if strings.HasPrefix(name, "graph-") {
+						graphsToQuery = append(graphsToQuery, name)
+					}
+					// Optionally include dynamic graphs
+					if strings.HasPrefix(name, "dynamic-graph-") {
+						graphsToQuery = append(graphsToQuery, name)
+					}
 				}
-				log.Printf("Query worker %d: Query[%d] failed on %s for %s (took %v): %v", workerID, queryIdx, clientName, graphName, duration, err)
-			} else {
-				log.Printf("Query worker %d: Query[%d] executed on %s for %s (took %v)", workerID, queryIdx, clientName, graphName, duration)
+			}
+
+			if len(graphsToQuery) == 0 {
+				log.Printf("Query worker %d: No graphs found to query on %s", workerID, clientName)
+				continue
+			}
+
+			// Walk through each graph and execute the query
+			for _, graphName := range graphsToQuery {
+				// Execute the query using GRAPH.RO_QUERY (read-only, works on both master and replica)
+				// This query visits all nodes and checks _created/_expired properties
+				startTime := time.Now()
+				_, err := client.Do(ctx, "GRAPH.RO_QUERY", graphName, nodePropertyQuery).Result()
+				duration := time.Since(startTime)
+
+				if err != nil {
+					// Check if it's a connectivity error to master
+					if clientName == "master" && isMasterConnectivityError(err, config.MasterAddr) {
+						handleMasterConnectivityLoss(err, config.MasterAddr, config, cancel)
+					}
+					// Check if graph doesn't exist (that's okay for dynamic graphs - may have been deleted by another worker)
+					errStr := err.Error()
+					if strings.Contains(errStr, "not found") ||
+						strings.Contains(errStr, "does not exist") ||
+						strings.Contains(errStr, "Unknown graph") ||
+						strings.Contains(errStr, "empty key") ||
+						strings.Contains(errStr, "Invalid graph operation on empty key") {
+						// Graph doesn't exist, skip silently (expected for dynamic graphs)
+						continue
+					}
+					log.Printf("Query worker %d: Query failed on %s for %s (took %v): %v", workerID, clientName, graphName, duration, err)
+				} else {
+					log.Printf("Query worker %d: Query executed on %s for %s (took %v)", workerID, clientName, graphName, duration)
+				}
 			}
 		}
 	}

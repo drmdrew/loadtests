@@ -98,11 +98,11 @@ services:
       - REDIS_MASTER=falkordb-master:6379
       - REDIS_REPLICA=falkordb-replica:6379
       - REDIS_REPLICA2=falkordb-replica2:6379
-      - QUERY_REPLICAS=falkordb-replica:6379 # ,falkordb-replica2:6379
+      - QUERY_REPLICAS=falkordb-replica:6379,falkordb-replica2:6379
       - EXIT_ON_MASTER_LOSS=false
       - SIMPLE_SEED_ONLY=false
-      - NUM_GRAPHS=25
-      - TARGET_NODES_PER_GRAPH=150
+      - NUM_GRAPHS=5
+      - TARGET_NODES_PER_GRAPH=10000
       - JITTER_MAX_MS=200
       - UPDATE_INTERVAL=1s
       - DYNAMIC_GRAPH_INTERVAL=500ms
@@ -111,7 +111,7 @@ services:
       - BGSAVE_INTERVAL=5m
       - NUM_DYNAMIC_GRAPH_WORKERS=2
       - NUM_UPDATE_WORKERS=2
-      - NUM_QUERY_WORKERS=10
+      - NUM_QUERY_WORKERS=20
       - NUM_GC_GARBAGE_WORKERS=2
     depends_on:
       falkordb-master:
