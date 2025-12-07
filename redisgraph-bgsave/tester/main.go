@@ -25,9 +25,12 @@ type Config struct {
 	NumGraphs              int
 	TargetNodesPerGraph    int // Number of nodes to create per graph
 	NumUpdateWorkers       int // Number of concurrent update workers
+	UpdateNodeCount        int // Number of nodes to update per update operation (0 = all nodes)
 	NumDynamicGraphWorkers int // Number of dynamic graph create/delete workers
+	DynamicGraphNodeCount  int // Number of nodes to delete/recreate per dynamic graph operation
 	NumQueryWorkers        int // Number of concurrent query workers
 	NumGCGarbageWorkers    int // Number of concurrent GC garbage workers (delete/recreate nodes)
+	GCGarbageNodeCount     int // Number of nodes to delete/recreate per GC garbage operation
 	JitterMaxMs            int // Maximum jitter in milliseconds (0-1000)
 	UpdateInterval         time.Duration
 	DynamicGraphInterval   time.Duration // Interval for dynamic graph operations
@@ -108,6 +111,13 @@ func getConfig() Config {
 		}
 	}
 
+	updateNodeCount := 0 // Default: 0 means update all nodes
+	if n := os.Getenv("UPDATE_NODE_COUNT"); n != "" {
+		if parsed, err := strconv.Atoi(n); err == nil && parsed >= 0 {
+			updateNodeCount = parsed
+		}
+	}
+
 	jitterMaxMs := 100 // Default 100ms jitter
 	if n := os.Getenv("JITTER_MAX_MS"); n != "" {
 		if parsed, err := strconv.Atoi(n); err == nil && parsed >= 0 && parsed <= 1000 {
@@ -126,6 +136,13 @@ func getConfig() Config {
 	if d := os.Getenv("DYNAMIC_GRAPH_INTERVAL"); d != "" {
 		if parsed, err := time.ParseDuration(d); err == nil {
 			dynamicGraphInterval = parsed
+		}
+	}
+
+	dynamicGraphNodeCount := 100 // Default: delete/recreate 100 nodes
+	if n := os.Getenv("DYNAMIC_GRAPH_NODE_COUNT"); n != "" {
+		if parsed, err := strconv.Atoi(n); err == nil && parsed > 0 {
+			dynamicGraphNodeCount = parsed
 		}
 	}
 
@@ -157,6 +174,13 @@ func getConfig() Config {
 		}
 	}
 
+	gcGarbageNodeCount := 50 // Default: delete/recreate 50 nodes
+	if n := os.Getenv("GC_GARBAGE_NODE_COUNT"); n != "" {
+		if parsed, err := strconv.Atoi(n); err == nil && parsed > 0 {
+			gcGarbageNodeCount = parsed
+		}
+	}
+
 	exitOnMasterLoss := true // Default to exiting on master loss
 	if e := os.Getenv("EXIT_ON_MASTER_LOSS"); e != "" {
 		if parsed, err := strconv.ParseBool(e); err == nil {
@@ -172,9 +196,12 @@ func getConfig() Config {
 		NumGraphs:              numGraphs,
 		TargetNodesPerGraph:    targetNodesPerGraph,
 		NumUpdateWorkers:       numUpdateWorkers,
+		UpdateNodeCount:        updateNodeCount,
 		NumDynamicGraphWorkers: numDynamicGraphWorkers,
+		DynamicGraphNodeCount:  dynamicGraphNodeCount,
 		NumQueryWorkers:        numQueryWorkers,
 		NumGCGarbageWorkers:    numGCGarbageWorkers,
+		GCGarbageNodeCount:     gcGarbageNodeCount,
 		JitterMaxMs:            jitterMaxMs,
 		UpdateInterval:         updateInterval,
 		DynamicGraphInterval:   dynamicGraphInterval,
@@ -195,6 +222,17 @@ func createRedisClient(addr string) *redis.Client {
 		ReadTimeout:  60 * time.Second, // Timeout for socket reads (increased for slow queries)
 		WriteTimeout: 10 * time.Second, // Timeout for socket writes
 	})
+}
+
+// triggerBGSAVE triggers a BGSAVE on the given Redis client and logs the result
+func triggerBGSAVE(ctx context.Context, client *redis.Client, instanceName string) error {
+	result, err := client.Do(ctx, "BGSAVE").Result()
+	if err != nil {
+		log.Printf("Warning: BGSAVE failed on %s: %v", instanceName, err)
+		return err
+	}
+	log.Printf("BGSAVE initiated on %s: %v", instanceName, result)
+	return nil
 }
 
 // isMasterConnectivityError checks if an error indicates loss of connectivity to the master
@@ -395,7 +433,7 @@ func populateGraph(ctx context.Context, client *redis.Client, graphName string, 
 	// Step 2: Iteratively grow the graph with double-linked list structure
 	// For each new node i: create node i, then link it to node i-1 with NEXT and PREV relationships
 	for i := 1; i < targetNodes; i++ {
-		now := time.Now().Unix()
+		now = time.Now().Unix()
 		nodeName := fmt.Sprintf("node-%04d", i)
 		prevNodeName := fmt.Sprintf("node-%04d", i-1)
 
@@ -409,16 +447,12 @@ func populateGraph(ctx context.Context, client *redis.Client, graphName string, 
 			log.Printf("Warning: Failed to create node %s and link in %s: %v", nodeName, graphName, err)
 			// Continue anyway
 		} else if i%1000 == 0 {
-			// Log progress every 1000 nodes (since we have 10000 nodes now)
+			// Log progress every 1000 nodes
 			log.Printf("Created node %s in %s (progress: %d/%d)", nodeName, graphName, i+1, targetNodes)
 		}
-
-		// Small delay between iterations
-		time.Sleep(10 * time.Millisecond)
 	}
 
 	// Verify final node count
-	time.Sleep(200 * time.Millisecond)
 	count, err := getNodeCount(ctx, client, graphName)
 	if err != nil {
 		log.Printf("Warning: could not verify node count for %s: %v", graphName, err)
@@ -731,62 +765,93 @@ func updateWorker(ctx context.Context, client *redis.Client, config Config, canc
 			graphNum := rand.Intn(config.NumGraphs)
 			graphName := fmt.Sprintf("graph-%d", graphNum)
 
-			// Randomly decide whether to update all nodes or only a subset (~50%)
-			// This adds variability to the workload and lock contention patterns
-			updateAll := rand.Float32() < 0.5
 			now := time.Now().Unix()
+			nowMs := time.Now().UnixMilli()
 
-			var updateNodesQuery string
-			if updateAll {
-				// Update all nodes
-				updateNodesQuery = fmt.Sprintf("MATCH (n) SET n._updated = %d", now)
-			} else {
-				// Update roughly 50% of nodes using modulo on node ID
-				// This creates a different query pattern and lock contention
-				modValue := rand.Intn(2) // Randomly choose 0 or 1 for modulo
-				updateNodesQuery = fmt.Sprintf("MATCH (n) WHERE id(n) %% 2 = %d SET n._updated = %d", modValue, now)
-			}
+			// Production pattern: Sometimes update nodes, sometimes update relationships with _expired
+			// Randomly choose between different update patterns to match production behavior
+			updatePattern := rand.Float32()
 
-			_, err := client.Do(ctx, "GRAPH.QUERY", graphName, updateNodesQuery).Result()
-			if err != nil {
-				if isMasterConnectivityError(err, config.MasterAddr) {
-					handleMasterConnectivityLoss(err, config.MasterAddr, config, cancel)
+			if updatePattern < 0.4 {
+				// Pattern 1: Update node _updated timestamps (40% of the time)
+				var updateNodesQuery string
+				if config.UpdateNodeCount > 0 {
+					// Update a specific number of nodes using LIMIT
+					updateNodesQuery = fmt.Sprintf("MATCH (n) WITH n LIMIT %d SET n._updated = %d", config.UpdateNodeCount, now)
+				} else {
+					// Update all nodes (default behavior)
+					updateNodesQuery = fmt.Sprintf("MATCH (n) SET n._updated = %d", now)
 				}
-				log.Printf("Update nodes failed for %s: %v", graphName, err)
-				continue
-			}
 
-			// Then, update relationships (if any exist)
-			// Also vary relationship updates - sometimes update all, sometimes subset
-			if rand.Float32() < 0.5 {
-				// Update all relationships
-				updateRelsQuery := fmt.Sprintf("MATCH (n)-[r]->(m) SET r._updated = %d", now)
-				_, err2 := client.Do(ctx, "GRAPH.QUERY", graphName, updateRelsQuery).Result()
-				if err2 != nil {
-					if isMasterConnectivityError(err2, config.MasterAddr) {
-						handleMasterConnectivityLoss(err2, config.MasterAddr, config, cancel)
+				_, err := client.Do(ctx, "GRAPH.QUERY", graphName, updateNodesQuery).Result()
+				if err != nil {
+					if isMasterConnectivityError(err, config.MasterAddr) {
+						handleMasterConnectivityLoss(err, config.MasterAddr, config, cancel)
+					}
+					log.Printf("Update nodes failed for %s: %v", graphName, err)
+					continue
+				}
+				updateType := "all"
+				if config.UpdateNodeCount > 0 {
+					updateType = fmt.Sprintf("%d", config.UpdateNodeCount)
+				}
+				log.Printf("Updated %s nodes in %s", updateType, graphName)
+			} else if updatePattern < 0.7 {
+				// Pattern 2: Update relationship _updated timestamps (30% of the time)
+				var updateRelsQuery string
+				if config.UpdateNodeCount > 0 {
+					// Update relationships for a limited number of nodes
+					updateRelsQuery = fmt.Sprintf("MATCH (n)-[r]->(m) WITH n, r, m LIMIT %d SET r._updated = %d", config.UpdateNodeCount, now)
+				} else {
+					// Update all relationships
+					updateRelsQuery = fmt.Sprintf("MATCH (n)-[r]->(m) SET r._updated = %d", now)
+				}
+				_, err := client.Do(ctx, "GRAPH.QUERY", graphName, updateRelsQuery).Result()
+				if err != nil {
+					if isMasterConnectivityError(err, config.MasterAddr) {
+						handleMasterConnectivityLoss(err, config.MasterAddr, config, cancel)
 					}
 					// It's okay if there are no relationships, just log it
-					log.Printf("Update relationships failed for %s (may have no relationships): %v", graphName, err2)
+					log.Printf("Update relationships failed for %s (may have no relationships): %v", graphName, err)
+				} else {
+					updateType := "all"
+					if config.UpdateNodeCount > 0 {
+						updateType = fmt.Sprintf("%d", config.UpdateNodeCount)
+					}
+					log.Printf("Updated %s relationships in %s", updateType, graphName)
 				}
 			} else {
-				// Update relationships only for nodes with even IDs (roughly 50%)
-				updateRelsQuery := fmt.Sprintf("MATCH (n)-[r]->(m) WHERE id(n) %% 2 = 0 SET r._updated = %d", now)
-				_, err2 := client.Do(ctx, "GRAPH.QUERY", graphName, updateRelsQuery).Result()
-				if err2 != nil {
-					if isMasterConnectivityError(err2, config.MasterAddr) {
-						handleMasterConnectivityLoss(err2, config.MasterAddr, config, cancel)
+				// Pattern 3: Production pattern - scan relationships and set _expired based on _updated (30% of the time)
+				// Similar to production query: "MATCH (start)-[r]->(end) WHERE r._rel_source IS NULL AND r._expired IS NULL AND r._updated < X SET r._expired=Y"
+				// We'll use a threshold: expire relationships that haven't been updated in the last 5 minutes
+				thresholdMs := nowMs - 300000 // 5 minutes ago
+				expiredValue := nowMs
+
+				// Production pattern: scan all relationships and expire old ones
+				// This is a slow operation that scans all relationships (similar to 751ms production query)
+				expireRelsQuery := fmt.Sprintf(
+					"MATCH (start)-[r]->(end) WHERE r._expired IS NULL AND r._updated < %d SET r._expired = %d RETURN count(r) as expiredCount",
+					thresholdMs, expiredValue)
+
+				result, err := client.Do(ctx, "GRAPH.QUERY", graphName, expireRelsQuery).Result()
+				if err != nil {
+					if isMasterConnectivityError(err, config.MasterAddr) {
+						handleMasterConnectivityLoss(err, config.MasterAddr, config, cancel)
 					}
-					// It's okay if there are no relationships, just log it
-					log.Printf("Update relationships failed for %s (may have no relationships): %v", graphName, err2)
+					log.Printf("Expire relationships failed for %s: %v", graphName, err)
+				} else {
+					// Try to extract the count from result
+					expiredCount := "unknown"
+					if resultArray, ok := result.([]interface{}); ok && len(resultArray) >= 2 {
+						if dataRows, ok := resultArray[1].([]interface{}); ok && len(dataRows) > 0 {
+							if row, ok := dataRows[0].([]interface{}); ok && len(row) > 0 {
+								expiredCount = fmt.Sprintf("%v", row[0])
+							}
+						}
+					}
+					log.Printf("Expired %s relationships in %s (updated < %d)", expiredCount, graphName, thresholdMs)
 				}
 			}
-
-			updateType := "all"
-			if !updateAll {
-				updateType = "subset"
-			}
-			log.Printf("Updated %s nodes and relationships in %s", updateType, graphName)
 		}
 	}
 }
@@ -853,68 +918,105 @@ func dynamicGraphWorker(ctx context.Context, client *redis.Client, config Config
 				}
 			}
 
-			// Delete the graph if it exists (this triggers Globals_RemoveGraphByName)
-			// Use DEL command to delete the graph key
-			// If the graph doesn't exist (e.g., deleted by another worker), that's fine - just continue
-			deleted, err := client.Del(ctx, graphName).Result()
+			// Check if graph exists and has enough nodes
+			nodeCount, err := getNodeCount(ctx, client, graphName)
 			if err != nil {
-				if isMasterConnectivityError(err, config.MasterAddr) {
-					handleMasterConnectivityLoss(err, config.MasterAddr, config, cancel)
-				}
-				// Check if it's a "graph doesn't exist" error (expected when another worker deleted it)
+				// Check if error is because graph doesn't exist
 				errStr := err.Error()
 				if strings.Contains(errStr, "not found") ||
 					strings.Contains(errStr, "does not exist") ||
 					strings.Contains(errStr, "Unknown graph") ||
 					strings.Contains(errStr, "empty key") {
-					// Graph doesn't exist - this is expected, just continue to population
-					log.Printf("Graph %s doesn't exist (may have been deleted by another worker), proceeding to populate", graphName)
+					// Graph doesn't exist, skip (let ensureGraphsPopulated handle creation)
+					log.Printf("Graph %s doesn't exist, skipping", graphName)
+					continue
 				} else {
-					// Unexpected error
-					log.Printf("Warning: Failed to delete %s: %v", graphName, err)
-				}
-			} else if deleted > 0 {
-				log.Printf("Deleted %s", graphName)
-			} else {
-				// DEL returned 0, meaning the key didn't exist (another worker may have deleted it)
-				log.Printf("Graph %s doesn't exist (already deleted), proceeding to populate", graphName)
-			}
-
-			// Small delay before recreating
-			time.Sleep(50 * time.Millisecond)
-
-			// Recreate and populate the graph (this triggers Globals_AddGraph)
-			if config.SimpleSeedOnly {
-				if err := simpleSeedGraph(ctx, client, graphName); err != nil {
+					// Other error - skip
 					if isMasterConnectivityError(err, config.MasterAddr) {
 						handleMasterConnectivityLoss(err, config.MasterAddr, config, cancel)
 					}
-					// Check if it's a transient error (graph might have been recreated by another worker)
-					errStr := err.Error()
-					if strings.Contains(errStr, "already exists") {
-						log.Printf("Graph %s already exists (created by another worker), skipping", graphName)
-					} else {
-						log.Printf("Failed to recreate %s (simple seed): %v", graphName, err)
-					}
-				} else {
-					log.Printf("Recreated %s (simple seed)", graphName)
+					log.Printf("Graph %s exists but couldn't get node count (%v), skipping", graphName, err)
+					continue
 				}
-			} else {
-				if err := populateGraph(ctx, client, graphName, config.TargetNodesPerGraph); err != nil {
+			}
+
+			// Only proceed if graph has enough nodes to delete
+			if nodeCount < config.DynamicGraphNodeCount {
+				log.Printf("Graph %s has only %d nodes (need %d), skipping", graphName, nodeCount, config.DynamicGraphNodeCount)
+				continue
+			}
+
+			// Delete configurable number of nodes (this triggers graph operations and lock contention)
+			deleteCount := config.DynamicGraphNodeCount
+			deleteQuery := fmt.Sprintf("MATCH (n) WITH n LIMIT %d DELETE n", deleteCount)
+			_, err = client.Do(ctx, "GRAPH.QUERY", graphName, deleteQuery).Result()
+			if err != nil {
+				if isMasterConnectivityError(err, config.MasterAddr) {
+					handleMasterConnectivityLoss(err, config.MasterAddr, config, cancel)
+				}
+				// Graph might not exist or have nodes, that's okay
+				errStr := err.Error()
+				if strings.Contains(errStr, "not found") ||
+					strings.Contains(errStr, "does not exist") ||
+					strings.Contains(errStr, "Unknown graph") ||
+					strings.Contains(errStr, "empty key") {
+					// Graph doesn't exist, skip silently
+					continue
+				}
+				log.Printf("Dynamic graph worker: Failed to delete nodes from %s: %v", graphName, err)
+				continue
+			}
+
+			// Recreate nodes with double-linked list structure
+			// Find the last node to link from (or create a seed if needed)
+			now := time.Now().Unix()
+			seedQuery := "MATCH (n) WITH n ORDER BY n.name DESC LIMIT 1 RETURN n.name as lastName"
+			seedResult, err := client.Do(ctx, "GRAPH.QUERY", graphName, seedQuery).Result()
+			var lastNodeName string
+			if err == nil {
+				// Parse result to get last node name
+				if resultArray, ok := seedResult.([]interface{}); ok && len(resultArray) >= 2 {
+					if dataRows, ok := resultArray[1].([]interface{}); ok && len(dataRows) > 0 {
+						if row, ok := dataRows[0].([]interface{}); ok && len(row) > 0 {
+							if name, ok := row[0].(string); ok {
+								lastNodeName = name
+							}
+						}
+					}
+				}
+			}
+
+			// If we couldn't find a last node, create a seed node first
+			if lastNodeName == "" {
+				seedNodeName := fmt.Sprintf("seed-%d", now)
+				seedCreateQuery := fmt.Sprintf("CREATE (n:Node {name: '%s', _created: %d, _updated: %d}) RETURN n.name", seedNodeName, now, now)
+				_, err := client.Do(ctx, "GRAPH.QUERY", graphName, seedCreateQuery).Result()
+				if err != nil {
+					log.Printf("Dynamic graph worker: Failed to create seed node in %s: %v", graphName, err)
+					continue
+				}
+				lastNodeName = seedNodeName
+			}
+
+			// Create new nodes and link them in a chain
+			for i := 0; i < deleteCount; i++ {
+				nodeName := fmt.Sprintf("dynamic-node-%d-%d", now, i)
+				createNodeAndLinkQuery := fmt.Sprintf(
+					"MATCH (prev:Node {name: '%s'}) CREATE (n:Node {name: '%s', _created: %d, _updated: %d}), (prev)-[:NEXT]->(n), (n)-[:PREV]->(prev) RETURN n.name",
+					lastNodeName, nodeName, now, now)
+				_, err := client.Do(ctx, "GRAPH.QUERY", graphName, createNodeAndLinkQuery).Result()
+				if err != nil {
 					if isMasterConnectivityError(err, config.MasterAddr) {
 						handleMasterConnectivityLoss(err, config.MasterAddr, config, cancel)
 					}
-					// Check if it's a transient error (graph might have been recreated by another worker)
-					errStr := err.Error()
-					if strings.Contains(errStr, "already exists") {
-						log.Printf("Graph %s already exists (created by another worker), skipping", graphName)
-					} else {
-						log.Printf("Failed to recreate %s: %v", graphName, err)
-					}
-				} else {
-					log.Printf("Recreated %s with %d nodes", graphName, config.TargetNodesPerGraph)
+					log.Printf("Dynamic graph worker: Failed to create node %s in %s: %v", nodeName, graphName, err)
+					break
 				}
+				// Update lastNodeName for next iteration
+				lastNodeName = nodeName
 			}
+
+			log.Printf("Dynamic graph worker: Deleted and recreated %d nodes in %s", deleteCount, graphName)
 		}
 	}
 }
@@ -952,13 +1054,14 @@ func queryWorker(ctx context.Context, masterClient *redis.Client, replicaClients
 
 	// Array of queries that visit nodes and check _created and/or _expired properties
 	// Workers randomly select one query per iteration
+	// Queries can use $timestamp placeholder which will be replaced with current timestamp (milliseconds)
 	queries := []string{
 		// Simple query: just visit all nodes and check properties
-		"MATCH (n) RETURN n._created, n._expired, n.name, n._updated ORDER BY n._created",
-		// Complex query: processes all nodes with their relationships to make it slower (~1s target)
-		"MATCH (n) OPTIONAL MATCH (n)-[r:NEXT|PREV]->(m) WITH n, collect({relType: type(r), neighborCreated: m._created, neighborExpired: m._expired, neighborName: m.name, neighborUpdated: m._updated}) as neighbors WHERE n._created IS NOT NULL OR n._expired IS NOT NULL OR size(neighbors) > 0 RETURN n._created, n._expired, n.name, n._updated, neighbors[0..1000] as neighborData ORDER BY n._created",
-		// Medium complexity: traverse relationships and check properties
-		"MATCH (n)-[r:NEXT|PREV]->(m) WHERE n._created IS NOT NULL OR n._expired IS NOT NULL OR m._created IS NOT NULL OR m._expired IS NOT NULL RETURN n._created, n._expired, n.name, n._updated, m._created, m._expired, m.name, m._updated, type(r) ORDER BY n._created, m._created",
+		// "MATCH (n) RETURN n._created, n._expired, n.name, n._updated ORDER BY n._created",
+		// Production pattern: DISTINCT + COUNT on relationships with _expired/_created filters (similar to 1710ms query)
+		// Enhanced with more complex operations and longer timestamp window to increase lock hold time
+		// Uses 24 hour window (86400000ms) to match more relationships and force longer processing
+		"MATCH (a)-[r]->(b) WHERE ((r._expired IS NULL OR r._expired >= ($timestamp - 86400000)) AND r._created <= ($timestamp + 86400000)) WITH r, type(r) as relType, a, b, toString(r._created) + '-' + toString(r._expired) as relProps, abs(r._updated - r._created) as relAge WHERE size(relProps) > 0 RETURN DISTINCT relType, COUNT(relType) as count, avg(relAge) as avgAge, min(relAge) as minAge, max(relAge) as maxAge ORDER BY count DESC",
 	}
 
 	for {
@@ -1019,10 +1122,25 @@ func queryWorker(ctx context.Context, masterClient *redis.Client, replicaClients
 
 			// Walk through each graph and execute the selected query
 			for _, graphName := range graphsToQuery {
+				// Use RedisGraph parameterized queries with CYPHER clause
+				// All queries can use $timestamp parameter whether they need it or not
+				timestampMs := time.Now().UnixMilli()
+
+				// Build parameterized query: if query contains $timestamp, use CYPHER clause
+				var execQuery string
+				if strings.Contains(query, "$timestamp") {
+					// Use CYPHER clause format: "CYPHER timestamp=value query"
+					// The query can reference $timestamp directly - CYPHER clause sets the parameter
+					execQuery = fmt.Sprintf("CYPHER timestamp=%d %s", timestampMs, query)
+				} else {
+					// Query doesn't use timestamp, execute as-is
+					execQuery = query
+				}
+
 				// Execute the query using GRAPH.RO_QUERY (read-only, works on both master and replica)
 				// This query visits all nodes and checks _created/_expired properties
 				startTime := time.Now()
-				_, err := client.Do(ctx, "GRAPH.RO_QUERY", graphName, query).Result()
+				_, err := client.Do(ctx, "GRAPH.RO_QUERY", graphName, execQuery).Result()
 				duration := time.Since(startTime)
 
 				if err != nil {
@@ -1067,12 +1185,12 @@ func gcGarbageWorker(ctx context.Context, client *redis.Client, config Config, w
 			graphNum := rand.Intn(config.NumGraphs)
 			graphName := fmt.Sprintf("graph-%d", graphNum)
 
-			// Delete 50-75 nodes to create garbage for RediSearch GC
+			// Delete configurable number of nodes to create garbage for RediSearch GC
 			// Each node has 2 indexes (_updated and name), so deleting 1 node = 2 deleted docs
 			// To reliably hit the 100-doc threshold, we need at least 50 nodes deleted (creates 100+ deleted docs)
 			// Use WITH ... LIMIT ... DELETE pattern (LIMIT must come before DELETE in Cypher)
-			deleteCount := 50 + rand.Intn(26) // Random between 50-75 nodes (creates 100-150 deleted docs)
-			deletedDocs := deleteCount * 2    // Each node has 2 indexed properties
+			deleteCount := config.GCGarbageNodeCount
+			deletedDocs := deleteCount * 2 // Each node has 2 indexed properties
 			deleteQuery := fmt.Sprintf("MATCH (n) WITH n LIMIT %d DELETE n", deleteCount)
 			_, err := client.Do(ctx, "GRAPH.QUERY", graphName, deleteQuery).Result()
 			if err != nil {
@@ -1116,6 +1234,62 @@ func gcGarbageWorker(ctx context.Context, client *redis.Client, config Config, w
 	}
 }
 
+// checkBGSAVEStatus checks the BGSAVE status using INFO persistence
+func checkBGSAVEStatus(ctx context.Context, client *redis.Client, instanceName string) {
+	info, err := client.Info(ctx, "persistence").Result()
+	if err != nil {
+		return // Silently fail - not critical
+	}
+
+	// Parse rdb_bgsave_in_progress and rdb_last_bgsave_time_sec
+	lines := strings.Split(info, "\n")
+	var bgsaveInProgress bool
+	var lastBGSaveTimeSec int64 = -1
+	var bgsaveStartTime int64 = -1
+
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "rdb_bgsave_in_progress:") {
+			parts := strings.Split(line, ":")
+			if len(parts) == 2 {
+				if strings.TrimSpace(parts[1]) == "1" {
+					bgsaveInProgress = true
+				}
+			}
+		} else if strings.HasPrefix(line, "rdb_last_bgsave_time_sec:") {
+			parts := strings.Split(line, ":")
+			if len(parts) == 2 {
+				if parsed, err := strconv.ParseInt(strings.TrimSpace(parts[1]), 10, 64); err == nil {
+					lastBGSaveTimeSec = parsed
+				}
+			}
+		} else if strings.HasPrefix(line, "rdb_current_bgsave_time_sec:") {
+			parts := strings.Split(line, ":")
+			if len(parts) == 2 {
+				if parsed, err := strconv.ParseInt(strings.TrimSpace(parts[1]), 10, 64); err == nil {
+					bgsaveStartTime = parsed
+				}
+			}
+		}
+	}
+
+	if bgsaveInProgress {
+		if bgsaveStartTime > 0 {
+			// BGSAVE is in progress and we know how long it's been running
+			if bgsaveStartTime > 30 {
+				log.Printf("⚠️  BGSAVE on %s has been running for %d seconds - possible hang!", instanceName, bgsaveStartTime)
+			}
+		} else {
+			log.Printf("BGSAVE in progress on %s (duration unknown)", instanceName)
+		}
+	} else if lastBGSaveTimeSec > 0 {
+		// Last BGSAVE completed, log if it took a long time
+		if lastBGSaveTimeSec > 30 {
+			log.Printf("Last BGSAVE on %s took %d seconds", instanceName, lastBGSaveTimeSec)
+		}
+	}
+}
+
 func bgsaveWorker(ctx context.Context, masterClient *redis.Client, replicaClients []*redis.Client, config Config, cancel context.CancelFunc, done chan struct{}) {
 	ticker := time.NewTicker(config.BGSAVEInterval)
 	defer ticker.Stop()
@@ -1124,6 +1298,10 @@ func bgsaveWorker(ctx context.Context, masterClient *redis.Client, replicaClient
 	// Only log 🚨 BLOCKED after 10 consecutive failures
 	BLOCKED_THRESHOLD := 10
 	blockedCounters := make(map[string]int)
+
+	// Also check BGSAVE status periodically to detect long-running BGSAVEs
+	statusTicker := time.NewTicker(5 * time.Second)
+	defer statusTicker.Stop()
 
 	// Helper function to handle BGSAVE result for an instance
 	handleBGSaveResult := func(instanceName string, result interface{}, err error) {
@@ -1169,6 +1347,16 @@ func bgsaveWorker(ctx context.Context, masterClient *redis.Client, replicaClient
 			return
 		case <-done:
 			return
+		case <-statusTicker.C:
+			// Periodically check BGSAVE status to detect long-running BGSAVEs
+			checkBGSAVEStatus(ctx, masterClient, "master")
+			for i, replicaClient := range replicaClients {
+				replicaName := fmt.Sprintf("replica-%d", i+1)
+				if len(replicaClients) == 1 {
+					replicaName = "replica"
+				}
+				checkBGSAVEStatus(ctx, replicaClient, replicaName)
+			}
 		case <-ticker.C:
 			// Add random jitter to desynchronize BGSAVE triggers
 			time.Sleep(randomJitter(config.JitterMaxMs))
@@ -1277,8 +1465,8 @@ func main() {
 	if len(config.QueryReplicas) > 0 {
 		queryReplicasInfo = strings.Join(config.QueryReplicas, ",")
 	}
-	log.Printf("Config: Master=%s, Replicas=%s, QueryReplicas=%s, Graphs=%d, NodesPerGraph=%d, UpdateWorkers=%d, DynamicGraphWorkers=%d, QueryWorkers=%d, GCGarbageWorkers=%d, JitterMaxMs=%d, UpdateInterval=%v, DynamicGraphInterval=%v, QueryInterval=%v, GCGarbageInterval=%v, BGSAVEInterval=%v",
-		config.MasterAddr, replicaInfo, queryReplicasInfo, config.NumGraphs, config.TargetNodesPerGraph, config.NumUpdateWorkers, config.NumDynamicGraphWorkers, config.NumQueryWorkers, config.NumGCGarbageWorkers, config.JitterMaxMs, config.UpdateInterval, config.DynamicGraphInterval, config.QueryInterval, config.GCGarbageInterval, config.BGSAVEInterval)
+	log.Printf("Config: Master=%s, Replicas=%s, QueryReplicas=%s, Graphs=%d, NodesPerGraph=%d, UpdateWorkers=%d, UpdateNodeCount=%d, DynamicGraphWorkers=%d, DynamicGraphNodeCount=%d, QueryWorkers=%d, GCGarbageWorkers=%d, GCGarbageNodeCount=%d, JitterMaxMs=%d, UpdateInterval=%v, DynamicGraphInterval=%v, QueryInterval=%v, GCGarbageInterval=%v, BGSAVEInterval=%v",
+		config.MasterAddr, replicaInfo, queryReplicasInfo, config.NumGraphs, config.TargetNodesPerGraph, config.NumUpdateWorkers, config.UpdateNodeCount, config.NumDynamicGraphWorkers, config.DynamicGraphNodeCount, config.NumQueryWorkers, config.NumGCGarbageWorkers, config.GCGarbageNodeCount, config.JitterMaxMs, config.UpdateInterval, config.DynamicGraphInterval, config.QueryInterval, config.GCGarbageInterval, config.BGSAVEInterval)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -1331,6 +1519,17 @@ func main() {
 	if err := ensureGraphsPopulated(ctx, masterClient, config); err != nil {
 		log.Fatalf("Failed to populate graphs: %v", err)
 	}
+
+	// Trigger BGSAVE after population to persist data
+	log.Printf("Population complete, triggering BGSAVE on all instances to persist data...")
+	triggerBGSAVE(ctx, masterClient, "master")
+	triggerBGSAVE(ctx, replicaClient, "replica")
+	if replica2Client != nil {
+		triggerBGSAVE(ctx, replica2Client, "replica2")
+	}
+
+	// Wait a moment for BGSAVE to start
+	time.Sleep(1 * time.Second)
 
 	// Set up signal handling
 	sigChan := make(chan os.Signal, 1)
