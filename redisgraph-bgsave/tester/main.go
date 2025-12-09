@@ -986,11 +986,21 @@ func dynamicGraphWorker(ctx context.Context, client *redis.Client, config Config
 				}
 			}
 
-			// If we couldn't find a last node, create a seed node first
+			// If we couldn't find a last node, create a seed node first using MERGE pattern
 			if lastNodeName == "" {
 				seedNodeName := fmt.Sprintf("seed-%d", now)
-				seedCreateQuery := fmt.Sprintf("CREATE (n:Node {name: '%s', _created: %d, _updated: %d}) RETURN n.name", seedNodeName, now, now)
-				_, err := client.Do(ctx, "GRAPH.QUERY", graphName, seedCreateQuery).Result()
+				nowMs := time.Now().UnixMilli()
+				seedMergeQuery := fmt.Sprintf(
+					"MERGE (n:Node {name: '%s', scope_id: 'seed-scope'}) "+
+						"ON CREATE SET n._created = %d "+
+						"ON MATCH SET n._expired = null "+
+						"SET n.prop1 = 'seed', n.prop2 = 'seed', n.prop3 = 'seed', "+
+						"n.prop4 = 'seed', n.prop5 = 'seed', n.prop6 = 'seed', "+
+						"n.prop7 = 'seed', n.prop8 = 'seed', n.prop9 = 'seed', "+
+						"n.prop10 = 'seed', n._updated = %d "+
+						"RETURN n.name",
+					seedNodeName, nowMs, nowMs)
+				_, err := client.Do(ctx, "GRAPH.QUERY", graphName, seedMergeQuery).Result()
 				if err != nil {
 					log.Printf("Dynamic graph worker: Failed to create seed node in %s: %v", graphName, err)
 					continue
@@ -998,13 +1008,26 @@ func dynamicGraphWorker(ctx context.Context, client *redis.Client, config Config
 				lastNodeName = seedNodeName
 			}
 
-			// Create new nodes and link them in a chain
+			// Create new nodes and link them in a chain using MERGE pattern similar to production
 			for i := 0; i < deleteCount; i++ {
 				nodeName := fmt.Sprintf("dynamic-node-%d-%d", now, i)
-				createNodeAndLinkQuery := fmt.Sprintf(
-					"MATCH (prev:Node {name: '%s'}) CREATE (n:Node {name: '%s', _created: %d, _updated: %d}), (prev)-[:NEXT]->(n), (n)-[:PREV]->(prev) RETURN n.name",
-					lastNodeName, nodeName, now, now)
-				_, err := client.Do(ctx, "GRAPH.QUERY", graphName, createNodeAndLinkQuery).Result()
+				// Use MERGE pattern similar to production query with generic properties
+				// MERGE on name and scope_id (generic scope-like property)
+				scopeId := fmt.Sprintf("scope-%d", i%10) // Cycle through 10 different scopes
+				nowMs := time.Now().UnixMilli()
+				mergeNodeAndLinkQuery := fmt.Sprintf(
+					"MATCH (prev:Node {name: '%s'}) "+
+						"MERGE (n:Node {name: '%s', scope_id: '%s'}) "+
+						"ON CREATE SET n._created = %d "+
+						"ON MATCH SET n._expired = null "+
+						"SET n.prop1 = 'value%d', n.prop2 = 'value%d', n.prop3 = 'value%d', "+
+						"n.prop4 = 'value%d', n.prop5 = 'value%d', n.prop6 = 'value%d', "+
+						"n.prop7 = 'value%d', n.prop8 = 'value%d', n.prop9 = 'value%d', "+
+						"n.prop10 = 'value%d', n._updated = %d "+
+						"CREATE (prev)-[:NEXT]->(n), (n)-[:PREV]->(prev) "+
+						"RETURN ID(n)",
+					lastNodeName, nodeName, scopeId, nowMs, i, i, i, i, i, i, i, i, i, i, nowMs)
+				_, err := client.Do(ctx, "GRAPH.QUERY", graphName, mergeNodeAndLinkQuery).Result()
 				if err != nil {
 					if isMasterConnectivityError(err, config.MasterAddr) {
 						handleMasterConnectivityLoss(err, config.MasterAddr, config, cancel)
@@ -1062,6 +1085,8 @@ func queryWorker(ctx context.Context, masterClient *redis.Client, replicaClients
 		// Enhanced with more complex operations and longer timestamp window to increase lock hold time
 		// Uses 24 hour window (86400000ms) to match more relationships and force longer processing
 		"MATCH (a)-[r]->(b) WHERE ((r._expired IS NULL OR r._expired >= ($timestamp - 86400000)) AND r._created <= ($timestamp + 86400000)) WITH r, type(r) as relType, a, b, toString(r._created) + '-' + toString(r._expired) as relProps, abs(r._updated - r._created) as relAge WHERE size(relProps) > 0 RETURN DISTINCT relType, COUNT(relType) as count, avg(relAge) as avgAge, min(relAge) as minAge, max(relAge) as maxAge ORDER BY count DESC",
+		// Slow query: visits all nodes and performs cumulative hash calculation
+		"MATCH (n) WITH n ORDER BY n.name WITH n, n._updated + n._created as nodeSum, (n._updated * 31 + n._created * 7) % 1000000 as nodeHash, abs(n._updated - n._created) as nodeDiff, (n._updated * n._created) % 10000000 as nodeProduct, (n._updated * 17 + n._created * 13) % 5000000 as nodeHash2, (n._updated % 1000) * (n._created % 1000) as nodeHash3 RETURN sum(nodeHash) as cumulativeHash, count(*) as nodeCount, avg(n._updated) as avgUpdated, sum(nodeSum) as totalNodeSum, min(n._created) as minCreated, max(n._updated) as maxUpdated, avg(nodeDiff) as avgDiff, sum(nodeProduct) as totalProduct, sum(nodeHash2) as cumulativeHash2, sum(nodeHash3) as cumulativeHash3",
 	}
 
 	for {
@@ -1160,7 +1185,7 @@ func queryWorker(ctx context.Context, masterClient *redis.Client, replicaClients
 					}
 					log.Printf("Query worker %d: Query[%d] failed on %s for %s (took %v): %v", workerID, queryIdx, clientName, graphName, duration, err)
 				} else {
-					log.Printf("Query worker %d: Query[%d] executed on %s for %s (took %v)", workerID, queryIdx, clientName, graphName, duration)
+					// log.Printf("Query worker %d: Query[%d] executed on %s for %s (took %v)", workerID, queryIdx, clientName, graphName, duration)
 				}
 			}
 		}
