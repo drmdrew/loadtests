@@ -1,0 +1,138 @@
+services:
+  falkordb-master:
+    image: falkordb/falkordb:${FALKORDB_VERSION:-v4.16.3}
+    container_name: falkordb-master
+    restart: unless-stopped
+    # Uncomment if you need external access:
+    # ports:
+    #   - "16379:6379"
+    volumes:
+      - falkordb-master-data:/var/lib/falkordb/data
+    networks:
+      - falkordb-busy-test-network
+    cap_add:
+      - SYS_PTRACE
+    environment:
+      - BROWSER=0
+      - REDIS_ARGS=--dir /data --loglevel verbose
+      - FALKORDB_ARGS=THREAD_COUNT 32
+    healthcheck:
+      test: ["CMD-SHELL", "timeout 10s redis-cli ping"]
+      interval: 5s
+      timeout: 10s
+      retries: 30
+      start_period: 10s
+
+  falkordb-replica:
+    image: falkordb/falkordb:${FALKORDB_VERSION:-v4.16.3}
+    container_name: falkordb-replica
+    restart: unless-stopped
+    # Uncomment if you need external access:
+    # ports:
+    #   - "16380:6379"
+    volumes:
+      - falkordb-replica-data:/var/lib/falkordb/data
+    networks:
+      - falkordb-busy-test-network
+    cap_add:
+      - SYS_PTRACE
+    environment:
+      - BROWSER=0
+      - REDIS_ARGS=--dir /data --loglevel verbose --replicaof falkordb-master 6379
+      - FALKORDB_ARGS=THREAD_COUNT 32
+    depends_on:
+      falkordb-master:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "timeout 10s redis-cli ping"]
+      interval: 5s
+      timeout: 10s
+      retries: 30
+      start_period: 10s
+
+  falkordb-replica2:
+    image: falkordb/falkordb:${FALKORDB_VERSION:-v4.16.3}
+    container_name: falkordb-replica2
+    restart: unless-stopped
+    # Uncomment if you need external access:
+    # ports:
+    #   - "16381:6379"
+    volumes:
+      - falkordb-replica2-data:/var/lib/falkordb/data
+    networks:
+      - falkordb-busy-test-network
+    cap_add:
+      - SYS_PTRACE
+    environment:
+      - BROWSER=0
+      - REDIS_ARGS=--dir /data --loglevel verbose --replicaof falkordb-master 6379
+      - FALKORDB_ARGS=THREAD_COUNT 32
+    depends_on:
+      falkordb-master:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "timeout 10s redis-cli ping"]
+      interval: 5s
+      timeout: 10s
+      retries: 30
+      start_period: 10s
+
+  falkordb-testdriver:
+    build:
+      context: ./tester
+      dockerfile: Dockerfile
+    container_name: falkordb-testdriver
+    restart: unless-stopped
+    networks:
+      - falkordb-busy-test-network
+    environment:
+      - REDIS_MASTER=falkordb-master:6379
+      - REDIS_REPLICA=falkordb-replica:6379
+      - REDIS_REPLICA2=falkordb-replica2:6379
+      - QUERY_REPLICAS=falkordb-master:6379,falkordb-replica:6379,falkordb-replica2:6379
+      - EXIT_ON_MASTER_LOSS=false
+      - SIMPLE_SEED_ONLY=false
+      - NUM_GRAPHS=5
+      - TARGET_NODES_PER_GRAPH=1000000
+      - JITTER_MAX_MS=50
+      - UPDATE_INTERVAL=15s
+      - UPDATE_NODE_COUNT=5000
+      - NUM_DYNAMIC_GRAPH_WORKERS=0
+      - DYNAMIC_GRAPH_INTERVAL=500ms
+      - DYNAMIC_GRAPH_NODE_COUNT=1
+      - QUERY_INTERVAL=1ms
+      - GC_GARBAGE_INTERVAL=10s
+      - GC_GARBAGE_NODE_COUNT=500
+      - BGSAVE_INTERVAL=60s
+      - NUM_UPDATE_WORKERS=0
+      - NUM_QUERY_WORKERS=16
+      - NUM_GC_GARBAGE_WORKERS=0
+      - NUM_NODE_TYPES=10
+      - NUM_LABELS_PER_TYPE=10
+      - NUM_EXPIRE_WORKERS=3
+      - NUM_REPOPULATE_WORKERS=3
+      - EXPIRE_INTERVAL=15s
+      - EXPIRE_NODE_COUNT=50000
+      - NUM_GC_EXPIRED_WORKERS=1
+      - GC_PRE_BGSAVE_OFFSET=20s
+      - NUM_EXPIRE_REL_WORKERS=1
+      - EXPIRE_REL_INTERVAL=60s
+      - STALE_REL_THRESHOLD_SEC=30
+    depends_on:
+      falkordb-master:
+        condition: service_healthy
+      falkordb-replica:
+        condition: service_healthy
+      falkordb-replica2:
+        condition: service_healthy
+    stdin_open: true
+    tty: true
+
+volumes:
+  falkordb-master-data:
+  falkordb-replica-data:
+  falkordb-replica2-data:
+
+networks:
+  falkordb-busy-test-network:
+    driver: bridge
